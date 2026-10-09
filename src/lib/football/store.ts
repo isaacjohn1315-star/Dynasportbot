@@ -347,7 +347,16 @@ export async function loadRetryableEvents(sql: Sql, limit: number): Promise<Retr
       and (status = 'blocked' or attempts < ${MAX_EVENT_ATTEMPTS})
       and created_at > now() - interval '24 hours'
       and coalesce(last_error, '') not like 'PERMANENT:%'
-    order by created_at asc
+    -- Milestones (FT, HT, kick-off, shootout, terminal statuses) are retried
+    -- before ordinary events: a backlog of old failed goals must never crowd
+    -- a failed full-time post out of the limited retry window.
+    order by
+      case when kind in (
+        'fulltime','halftime','second_half','kickoff','extra_time',
+        'extra_time_break','penalty_shootout','shootout_update','postponed',
+        'cancelled','abandoned','suspended','interrupted','awarded','walkover'
+      ) then 0 else 1 end asc,
+      created_at asc
     limit ${limit}`) as {
     event_key: string;
     fixture_id: number | string;

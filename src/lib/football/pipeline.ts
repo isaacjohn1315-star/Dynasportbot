@@ -23,13 +23,14 @@ import {
   safeEvents,
   isKnownEventType,
   isKnownStatus,
+  isMilestoneKind,
   isInPlay,
   isTerminalStatus,
   sortCandidates,
 } from "./lifecycle";
-import { classifyCompetition } from "./tiers";
+import { classifyCompetition, competitionDecision } from "./tiers";
 import { resolveTeamFlag } from "./teamMeta";
-import { buildLineupPostData, composeMessage, formatMemberLines } from "./messages";
+import { buildLineupPostData, composeMessage, formatMemberLines, hasPublishableContent } from "./messages";
 import {
   claimEvent,
   claimRetry,
@@ -85,6 +86,8 @@ export interface AutomationSummary {
   postingFailed: number;
   duplicatesSkipped: number;
   retriedPosts: number;
+  milestonesPosted: number;
+  milestonesDeferred: number;
   skippedFixtures: number;
   unresolvedFixtures: number;
   facebookAuthBlocked: boolean;
@@ -106,6 +109,11 @@ function sleep(ms: number): Promise<void> {
 const MAX_LINEUP_FETCHES_PER_RUN = 2;
 /** Stop publishing before the serverless function is killed (maxDuration 60s). */
 const RUN_TIME_BUDGET_MS = 45000;
+/**
+ * Milestones may use more of the invocation than ordinary events: a missed
+ * FT cannot be recreated by diffing once the fixture leaves the live list.
+ */
+const MILESTONE_TIME_BUDGET_MS = 52000;
 /** Failed posts re-attempted per run (database only - costs no API requests). */
 const MAX_RETRIES_PER_RUN = 5;
 /** Only keep trying to fetch a Starting XI while the match is young. */
@@ -143,6 +151,8 @@ export async function runAutomation(): Promise<AutomationSummary> {
     postingFailed: 0,
     duplicatesSkipped: 0,
     retriedPosts: 0,
+    milestonesPosted: 0,
+    milestonesDeferred: 0,
     skippedFixtures: 0,
     unresolvedFixtures: 0,
     facebookAuthBlocked: false,
@@ -208,12 +218,24 @@ export async function runAutomation(): Promise<AutomationSummary> {
      * requests, lineups, posting, dashboard - ever sees them.
      */
     const allLive = liveFixtures;
-    liveFixtures = allLive.filter((f) => competitionTier(f) === 1);
+    const rejectionReasons: string[] = [];
+    liveFixtures = allLive.filter((f) => {
+      const decision = competitionDecision(
+        f.league?.name,
+        f.league?.country ?? null,
+        typeof f.league?.id === "number" ? f.league.id : null,
+      );
+      if (!decision.approved && decision.reason) rejectionReasons.push(decision.reason);
+      return decision.approved;
+    });
+    /** Fixture IDs cleared by the allowlist - the posting gate's source of truth. */
+    const approvedFixtureIds = new Set(liveFixtures.map((f) => f.fixture.id));
     summary.eligibleFixtures = liveFixtures.length;
     summary.excludedFixtures = allLive.length - liveFixtures.length;
     if (summary.excludedFixtures > 0) {
+      const sample = [...new Set(rejectionReasons)].slice(0, 5);
       summary.notes.push(
-        `${summary.excludedFixtures} live fixture(s) excluded: competition not in the Tier 1 allowlist.`,
+        `${summary.excludedFixtures} live fixture(s) excluded by the competition allowlist. ${sample.join(" | ")}`,
       );
     }
 
@@ -312,6 +334,17 @@ export async function runAutomation(): Promise<AutomationSummary> {
         for (const fixture of detail.fixtures) {
           const fixtureId = fixture.fixture.id;
           try {
+            // Re-verify: a fixture must never enter via a detail lookup.
+            const decision = competitionDecision(
+              fixture.league?.name,
+              fixture.league?.country ?? null,
+              typeof fixture.league?.id === "number" ? fixture.league.id : null,
+            );
+            if (!decision.approved) {
+              summary.notes.push(`Recovered fixture ${fixtureId} rejected: ${decision.reason}`);
+              continue;
+            }
+            approvedFixtureIds.add(fixtureId);
             const previous =
               recoveredStates.get(fixtureId)?.snapshot ?? states.get(fixtureId)?.snapshot ?? null;
             candidates.push(...diffFixture(previous, fixture, { bootstrap }));
@@ -474,16 +507,55 @@ export async function runAutomation(): Promise<AutomationSummary> {
       unique.delete(liveKey);
     }
 
+    /**
+     * FINAL ALLOWLIST GATE.
+     * Every candidate - including ones produced by detail lookups or carried
+     * over from an earlier phase - must belong to a fixture cleared by the
+     * allowlist. Nothing reaches Facebook without passing this check.
+     */
+    for (const [mapKey, candidate] of [...unique.entries()]) {
+      if (!approvedFixtureIds.has(candidate.fixtureId)) {
+        unique.delete(mapKey);
+        summary.notes.push(
+          `Blocked post for fixture ${candidate.fixtureId}: competition not approved (posting gate).`,
+        );
+        continue;
+      }
+      // Never publish a bare status line with no renderable event (filler).
+      if (!hasPublishableContent(candidate)) {
+        unique.delete(mapKey);
+      }
+    }
+
     const ordered = sortCandidates([...unique.values()]);
-    const toProcess = bootstrap ? [] : ordered.slice(0, MAX_POSTS_PER_RUN);
-    if (ordered.length > toProcess.length) {
-      summary.notes.push(`${ordered.length - toProcess.length} event(s) skipped by the per-run post cap of ${MAX_POSTS_PER_RUN}.`);
+
+    /**
+     * MILESTONE PRIORITY.
+     *
+     * Major match-state transitions (kick-off, HT, 2H, ET, shootout, FT/AET/
+     * PEN, terminal statuses) are split into their own priority class and
+     * published FIRST, before any ordinary event.
+     *
+     * Root cause this fixes: milestones sort by match minute, so FT lands at
+     * minute ~997 - dead last. The per-run post cap truncated from the end and
+     * the run-time guard deferred from the end, which meant full-time was the
+     * very first post to be dropped on a busy run. Milestones are now never
+     * queued behind goals, lineups or cards and are exempt from the ordinary
+     * post cap.
+     */
+    const milestoneQueue = bootstrap ? [] : ordered.filter((c) => isMilestoneKind(c.kind));
+    const ordinaryAll = bootstrap ? [] : ordered.filter((c) => !isMilestoneKind(c.kind));
+    const ordinaryQueue = ordinaryAll.slice(0, MAX_POSTS_PER_RUN);
+    if (ordinaryAll.length > ordinaryQueue.length) {
+      summary.notes.push(
+        `${ordinaryAll.length - ordinaryQueue.length} ordinary event(s) skipped by the per-run post cap of ${MAX_POSTS_PER_RUN} (milestones unaffected).`,
+      );
     }
     summary.candidates = ordered.length;
 
     /* 7) Claim -> compose -> post -> mark (all idempotent via Neon event keys). */
     const facebookReady = isFacebookConfigured();
-    if (!facebookReady && toProcess.length > 0) {
+    if (!facebookReady && milestoneQueue.length + ordinaryQueue.length > 0) {
       summary.notes.push(
         "Facebook is not configured (FACEBOOK_PAGE_ID / FACEBOOK_PAGE_ACCESS_TOKEN) - events tracked but not posted.",
       );
@@ -616,16 +688,18 @@ export async function runAutomation(): Promise<AutomationSummary> {
 
     const outOfTime = () => Date.now() - startedAt.getTime() > RUN_TIME_BUDGET_MS;
 
+    /**
+     * Retries replay a stored message for a fixture claimed in an earlier run.
+     * If that fixture is visible in this run it must still be approved; if it
+     * is not visible we allow the retry, because the event was already cleared
+     * by the gate when it was first claimed.
+     */
+    const seenThisRun = new Set<number>([...snapshots.keys()]);
+    const retryApprovalBlocked = (fixtureId: number): boolean =>
+      seenThisRun.has(fixtureId) && !approvedFixtureIds.has(fixtureId);
+
     if (facebookReady) {
-      let deferred = 0;
-      for (const candidate of toProcess) {
-        // Leave the remaining events for the next heartbeat rather than being
-        // killed mid-publish by the platform's function timeout, and stop
-        // immediately if the Page token is rejected.
-        if (outOfTime() || authBlocked) {
-          deferred += 1;
-          continue;
-        }
+      const publish = async (candidate: CandidateEvent) => {
         try {
           if (candidate.kind === "live_update" || (candidate.members?.length ?? 0) > 0) {
             await postGroupedUpdate(candidate);
@@ -636,9 +710,37 @@ export async function runAutomation(): Promise<AutomationSummary> {
           summary.postingFailed += 1;
           summary.notes.push(`Unexpected posting error (${candidate.eventKey}): ${errorMessage(error)}`);
         }
+      };
+
+      /* 7a) MILESTONES FIRST - never starved by ordinary events. They use a
+             wider time allowance because a missed milestone (especially FT)
+             cannot be regenerated by snapshot diffing on a later run. */
+      for (const candidate of milestoneQueue) {
+        if (authBlocked) {
+          summary.milestonesDeferred += 1;
+          continue;
+        }
+        if (Date.now() - startedAt.getTime() > MILESTONE_TIME_BUDGET_MS) {
+          summary.milestonesDeferred += 1;
+          summary.notes.push(`Milestone deferred to the next run (time budget): ${candidate.eventKey}`);
+          continue;
+        }
+        const before = summary.posted;
+        await publish(candidate);
+        if (summary.posted > before) summary.milestonesPosted += 1;
+      }
+
+      /* 7b) Ordinary events, subject to the per-run cap and time budget. */
+      let deferred = 0;
+      for (const candidate of ordinaryQueue) {
+        if (outOfTime() || authBlocked) {
+          deferred += 1;
+          continue;
+        }
+        await publish(candidate);
       }
       if (deferred > 0) {
-        summary.notes.push(`${deferred} event(s) deferred to the next run (run time budget).`);
+        summary.notes.push(`${deferred} ordinary event(s) deferred to the next run (run time budget).`);
       }
 
       /* 7b) Retry previously failed posts. Snapshot diffing will not recreate
@@ -647,6 +749,8 @@ export async function runAutomation(): Promise<AutomationSummary> {
       try {
         const retryables = authBlocked ? [] : await loadRetryableEvents(sql, MAX_RETRIES_PER_RUN);
         for (const retryable of retryables) {
+          // A retry must never resurrect a fixture that is no longer approved.
+          if (retryApprovalBlocked(retryable.fixtureId)) continue;
           if (outOfTime() || authBlocked) break;
           const claimed = await claimRetry(sql, retryable.eventKey);
           if (!claimed) continue;

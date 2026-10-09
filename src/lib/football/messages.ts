@@ -84,9 +84,25 @@ export function formatMemberGroup(m: UpdateMember): string[] {
       if (off && on) return [`🔄 Substitution: ${on} replaces ${off}${time}`];
       return [];
     }
-    case "var": {
+    /* ------------------------------ VAR outcomes ------------------------------ */
+    case "var_red_upgrade":
+      // Yellow upgraded to red after review. Only claimed when the provider
+      // explicitly reports the upgrade.
+      return who ? [`🟥 Red Card (VAR upgrade): ${who}${time}`] : [];
+    case "var_goal_disallowed":
+      return [`🚫 Goal disallowed after VAR${who ? `: ${who}` : ""}${time}`];
+    case "var_goal_awarded":
+      return [`⚽️ Goal awarded after VAR${who ? `: ${who}` : ""}${time}`];
+    case "var_penalty_awarded":
+      return [`⚖️ Penalty awarded after VAR${who ? `: ${who}` : ""}${time}`];
+    case "var_penalty_overturned":
+      return [`⚖️ Penalty overturned after VAR${who ? `: ${who}` : ""}${time}`];
+    case "var_review": {
+      // No confirmed outcome: publish only if the provider supplied readable
+      // text, and never assert that a decision changed.
       const detail = (m.detail ?? "").trim();
-      return detail ? [`📺 VAR: ${detail}${time}`] : [];
+      if (!detail) return [];
+      return [`📺 VAR review: ${detail}${time}`];
     }
     default:
       return [];
@@ -108,7 +124,12 @@ const MEMBER_ORDER: Record<UpdateMember["kind"], number> = {
   missed_penalty: 1,
   red_card: 2,
   yellow_card: 3,
-  var: 4,
+  var_red_upgrade: 2,
+  var_goal_disallowed: 4,
+  var_goal_awarded: 4,
+  var_penalty_awarded: 4,
+  var_penalty_overturned: 4,
+  var_review: 4,
   substitution: 5,
 };
 
@@ -172,6 +193,21 @@ export function buildLineupPostData(
 }
 
 /* ------------------------------ Compose ------------------------------ */
+
+/**
+ * True when a candidate will actually render publishable content.
+ *
+ * A live update whose events all render empty (e.g. a VAR review with no
+ * readable detail, or a card with no player name) must NOT be published as a
+ * bare status line - that is filler. Score changes and status posts are
+ * always meaningful on their own.
+ */
+export function hasPublishableContent(c: CandidateEvent): boolean {
+  if (c.kind !== "live_update") return true;
+  if (memberGroups(c).length > 0) return true;
+  // No renderable events: only worth posting if the score itself changed.
+  return c.scoreChanged === true || c.joined === true;
+}
 
 export function composeMessage(c: CandidateEvent): string {
   switch (c.kind) {

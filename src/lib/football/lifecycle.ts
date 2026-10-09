@@ -267,7 +267,19 @@ export function toUpdateMember(event: SnapshotEvent): UpdateMember | null {
   } else if (type === "subst") {
     kind = "substitution";
   } else if (type === "var") {
-    kind = "var";
+    /**
+     * API-Football reports VAR outcomes through the `detail` string
+     * ("Goal cancelled", "Penalty confirmed", "Card upgraded", ...).
+     * Map them to precise, fan-readable decisions. An unmapped or empty
+     * detail becomes a generic review which the formatter drops unless the
+     * text is meaningful - we never claim a decision changed.
+     */
+    if (detail.includes("card upgraded") || detail.includes("red card")) kind = "var_red_upgrade";
+    else if (detail.includes("goal cancelled") || detail.includes("goal disallowed")) kind = "var_goal_disallowed";
+    else if (detail.includes("goal confirmed") || detail.includes("goal awarded")) kind = "var_goal_awarded";
+    else if (detail.includes("penalty cancelled") || detail.includes("penalty disallowed") || detail.includes("penalty overturned")) kind = "var_penalty_overturned";
+    else if (detail.includes("penalty confirmed") || detail.includes("penalty awarded")) kind = "var_penalty_awarded";
+    else kind = "var_review";
   }
   // Everything else - corners, statistics and any unknown incident type - is
   // deliberately NOT published. Unknown types are ignored, never invented.
@@ -398,8 +410,14 @@ export function diffFixture(
   const prevAway = previous.goalsAway ?? 0;
   const scoreChanged = !scoreUnknown && (nextHome !== prevHome || nextAway !== prevAway);
 
-  // New timeline events since the stored snapshot.
-  const previousKeys = new Set(previous.events.map((e) => e.key));
+  /**
+   * New timeline events since the stored snapshot.
+   * `previous.events` is read defensively: a legacy or partially-written
+   * snapshot row without an events array used to throw here, which aborted
+   * the whole fixture and silently lost its milestones (including FT).
+   */
+  const previousEvents = Array.isArray(previous.events) ? previous.events : [];
+  const previousKeys = new Set(previousEvents.map((e) => e?.key).filter(Boolean));
   const freshSnapshotEvents = nextEvents.filter((e) => !previousKeys.has(e.key));
   const members = toMembers(id, freshSnapshotEvents);
 
@@ -430,6 +448,49 @@ export function diffFixture(
   }
 
   return finish(candidates);
+}
+
+/**
+ * Major match-state milestones. These get an independent processing path and
+ * are never queued behind goals, lineups, cards or other ordinary events.
+ * Kick-off, HT, 2H, ET, ET break, shootout start/updates, FT/AET/PEN and the
+ * terminal statuses (postponed/cancelled/abandoned/suspended/interrupted/
+ * awarded/walkover) all qualify.
+ */
+export const MILESTONE_KINDS: ReadonlySet<CandidateKind> = new Set<CandidateKind>([
+  "kickoff",
+  "halftime",
+  "second_half",
+  "extra_time",
+  "extra_time_break",
+  "penalty_shootout",
+  "shootout_update",
+  "fulltime",
+  "postponed",
+  "cancelled",
+  "abandoned",
+  "suspended",
+  "interrupted",
+  "awarded",
+  "walkover",
+]);
+
+export function isMilestoneKind(kind: CandidateKind): boolean {
+  return MILESTONE_KINDS.has(kind);
+}
+
+/** Event kinds that deserve their own post rather than being grouped. */
+const TOP_INCIDENT_MEMBERS: ReadonlySet<string> = new Set([
+  "red_card",
+  "var_red_upgrade",
+  "var_goal_disallowed",
+  "var_goal_awarded",
+  "var_penalty_awarded",
+  "var_penalty_overturned",
+]);
+
+export function isTopIncidentMember(kind: string): boolean {
+  return TOP_INCIDENT_MEMBERS.has(kind);
 }
 
 const KIND_RANK: Record<CandidateKind, number> = {

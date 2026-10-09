@@ -156,7 +156,13 @@ export type MemberKind =
   | "yellow_card"
   | "red_card"
   | "substitution"
-  | "var";
+  /* VAR outcomes, derived from the provider's own detail strings. */
+  | "var_red_upgrade"
+  | "var_goal_disallowed"
+  | "var_goal_awarded"
+  | "var_penalty_awarded"
+  | "var_penalty_overturned"
+  | "var_review";
 
 /** One API-Football timeline event inside a grouped live update. */
 export interface UpdateMember {
