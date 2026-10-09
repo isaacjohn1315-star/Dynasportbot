@@ -394,9 +394,12 @@ export function diffFixture(
       // Mid-match join: publish the current events, split by category.
       const joinBuckets = new Map<string, UpdateMember[]>();
       for (const member of members) {
-        const category = eventCategory(member.kind);
-        if (category === "var") joinBuckets.set(`var:${member.key}`, [member]);
-        else joinBuckets.set(category, [...(joinBuckets.get(category) ?? []), member]);
+        if (isPerIncidentKind(member.kind)) {
+          joinBuckets.set(`${member.kind}:${member.key}`, [member]);
+        } else {
+          const category = eventCategory(member.kind);
+          joinBuckets.set(category, [...(joinBuckets.get(category) ?? []), member]);
+        }
       }
       for (const bucketMembers of joinBuckets.values()) {
         candidates.push(
@@ -471,28 +474,34 @@ export function diffFixture(
    */
   const buckets = new Map<string, UpdateMember[]>();
   for (const member of members) {
-    const category = eventCategory(member.kind);
-    if (category === "var") {
-      buckets.set(`var:${member.key}`, [member]);
+    if (isPerIncidentKind(member.kind)) {
+      /**
+       * Each GOAL (with its assist), each RED CARD, each MISSED PENALTY and
+       * each VAR decision is published as its own post. Yellow cards and
+       * substitutions keep the existing same-category grouping.
+       */
+      buckets.set(`${member.kind}:${member.key}`, [member]);
     } else {
+      const category = eventCategory(member.kind);
       buckets.set(category, [...(buckets.get(category) ?? []), member]);
     }
   }
 
-  // The score line belongs with the goal update; a score change with no goal
-  // event still produces a score-only update (existing behaviour).
-  const goalBucket = buckets.get("goal");
-  if (goalBucket) {
-    candidates.push(
-      liveUpdateCandidate(fixture, goalBucket, { scoreChanged, prevHome, prevAway }),
-    );
+  // A score change with no goal event still produces a score-only update.
+  const goalEntries = [...buckets.entries()].filter(([k]) => k.startsWith("goal:"));
+  if (goalEntries.length > 0) {
+    for (const [, goalMembers] of goalEntries) {
+      candidates.push(
+        liveUpdateCandidate(fixture, goalMembers, { scoreChanged, prevHome, prevAway }),
+      );
+    }
   } else if (scoreChanged) {
     candidates.push(
       liveUpdateCandidate(fixture, [], { scoreChanged, prevHome, prevAway }),
     );
   }
   for (const [bucketKey, bucketMembers] of buckets) {
-    if (bucketKey === "goal") continue;
+    if (bucketKey.startsWith("goal:")) continue;
     candidates.push(
       liveUpdateCandidate(fixture, bucketMembers, { scoreChanged: false, prevHome, prevAway }),
     );
@@ -556,6 +565,23 @@ export function isMilestoneKind(kind: CandidateKind): boolean {
  * separate VAR incidents are unrelated to one another.
  */
 export type EventCategory = "goal" | "card" | "substitution" | "penalty" | "var";
+
+/**
+ * Events that must each be published as their OWN post, never grouped with
+ * anything else: goals (with their assist), red cards, missed penalties and
+ * every VAR decision. Yellow cards and substitutions keep the existing
+ * same-category grouping.
+ */
+export function isPerIncidentKind(kind: MemberKind): boolean {
+  switch (kind) {
+    case "red_card":
+    case "missed_penalty":
+      return true;
+    default:
+      // Goals and every VAR outcome are per-incident.
+      return eventCategory(kind) === "goal" || eventCategory(kind) === "var";
+  }
+}
 
 export function eventCategory(kind: MemberKind): EventCategory {
   switch (kind) {

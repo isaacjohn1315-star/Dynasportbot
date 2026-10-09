@@ -475,13 +475,14 @@ export async function runAutomation(): Promise<AutomationSummary> {
     const unique = new Map<string, CandidateEvent>();
     for (const c of candidates) {
       if (c.kind === "live_update") {
-        // Keyed per event CATEGORY so a fixture's goal, card, substitution,
-        // penalty and VAR updates are never collapsed into one another. VAR
-        // candidates are per-incident, so their key also carries the incident
-        // (first member key) - otherwise two unrelated VAR decisions would be
-        // collapsed into a single post.
-        const incident = (c.category ?? "goal") === "var" ? `:${c.members?.[0]?.key ?? ""}` : "";
-        const catKey = `live_update:${c.fixtureId}:${c.category ?? "goal"}${incident}`;
+        // Keyed per event CATEGORY plus the incident (first member key), so a
+        // fixture's goal, red-card, missed-penalty and VAR posts are never
+        // collapsed into one another, while duplicate candidates produced for
+        // the same incident (e.g. heartbeat + detail diff) still collapse to
+        // the richest copy. Score-only updates key on the category alone.
+        const cat = c.category ?? "goal";
+        const incident = c.members?.[0]?.key ?? "score";
+        const catKey = `live_update:${c.fixtureId}:${cat}:${incident}`;
         const existing = unique.get(catKey);
         if (!existing || (c.members?.length ?? 0) > (existing.members?.length ?? 0)) {
           unique.set(catKey, c);
@@ -505,10 +506,20 @@ export async function runAutomation(): Promise<AutomationSummary> {
        * in the same run remain their own category posts - mixing them into the
        * FT post would violate the category-grouping rule.
        */
-      const liveKey = `live_update:${candidate.fixtureId}:goal`;
-      const live = unique.get(liveKey);
-      if (!live) continue;
-      const merged = [...(candidate.members ?? []), ...(live.members ?? [])];
+      /**
+       * Collect EVERY unpublished goal-category candidate for this fixture
+       * (goals are now individual posts) and merge them under the full-time
+       * line, preserving chronological order.
+       */
+      const goalPrefix = `live_update:${candidate.fixtureId}:goal`;
+      const goalCandidates = [...unique.entries()].filter(
+        ([k, v]) => k.startsWith(goalPrefix) && v.kind === "live_update",
+      );
+      if (goalCandidates.length === 0) continue;
+      const merged = [
+        ...(candidate.members ?? []),
+        ...goalCandidates.flatMap(([, v]) => v.members ?? []),
+      ];
       const seen = new Set<string>();
       candidate.members = merged.filter((m) => {
         if (seen.has(m.key)) return false;
@@ -516,7 +527,7 @@ export async function runAutomation(): Promise<AutomationSummary> {
         return true;
       });
       // Keep the authoritative final score from the full-time payload.
-      unique.delete(liveKey);
+      for (const [k] of goalCandidates) unique.delete(k);
     }
 
     /**
