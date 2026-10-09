@@ -69,7 +69,14 @@ export function formatMemberGroup(m: UpdateMember): string[] {
       return lines;
     }
     case "penalty_goal":
-      return who ? [`⚽️ Penalty Goal: ${who}${time}`] : [];
+      /**
+       * A successfully taken penalty IS a goal, so it keeps the standard
+       * "⚽️ Goal:" label; the penalty is identified within the goal details
+       * ("(48' pen)"), never as the main event label.
+       */
+      return who
+        ? [`⚽️ Goal: ${who}${minute ? ` (${minute}${MIN} pen)` : " (pen)"}`]
+        : [];
     case "own_goal":
       return who ? [`⚽️ Own Goal: ${who}${time}`] : [];
     case "missed_penalty":

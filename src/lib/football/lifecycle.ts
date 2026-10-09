@@ -326,6 +326,7 @@ function liveUpdateCandidate(
   c.prevHome = options.prevHome;
   c.prevAway = options.prevAway;
   c.eventKey = members[0]?.key ?? `fx${fixture.fixture.id}:lu:placeholder`;
+  c.category = members.length > 0 ? eventCategory(members[0].kind) : "goal";
   return c;
 }
 
@@ -389,18 +390,29 @@ export function diffFixture(
       kickoff.prevHome = 0;
       kickoff.prevAway = 0;
       candidates.push(kickoff);
-      if (members.length > 0) {
-        candidates.push(liveUpdateCandidate(fixture, members, { scoreChanged: false, prevHome: 0, prevAway: 0 }));
-      }
     } else if (!isTerminalStatus(nextShort)) {
-      candidates.push(
-        liveUpdateCandidate(fixture, members, {
-          scoreChanged: nextHome !== 0 || nextAway !== 0 || members.length > 0,
-          joined: true,
-          prevHome: null,
-          prevAway: null,
-        }),
-      );
+      // Mid-match join: publish the current events, split by category.
+      const joinBuckets = new Map<string, UpdateMember[]>();
+      for (const member of members) {
+        const category = eventCategory(member.kind);
+        if (category === "var") joinBuckets.set(`var:${member.key}`, [member]);
+        else joinBuckets.set(category, [...(joinBuckets.get(category) ?? []), member]);
+      }
+      for (const bucketMembers of joinBuckets.values()) {
+        candidates.push(
+          liveUpdateCandidate(fixture, bucketMembers, {
+            scoreChanged: false,
+            joined: true,
+            prevHome: null,
+            prevAway: null,
+          }),
+        );
+      }
+      if (joinBuckets.size === 0 && (nextHome !== 0 || nextAway !== 0)) {
+        candidates.push(
+          liveUpdateCandidate(fixture, [], { scoreChanged: true, joined: true, prevHome: null, prevAway: null }),
+        );
+      }
     }
     return finish(candidates);
   }
@@ -419,12 +431,70 @@ export function diffFixture(
   const previousEvents = Array.isArray(previous.events) ? previous.events : [];
   const previousKeys = new Set(previousEvents.map((e) => e?.key).filter(Boolean));
   const freshSnapshotEvents = nextEvents.filter((e) => !previousKeys.has(e.key));
-  const members = toMembers(id, freshSnapshotEvents);
+  let members = toMembers(id, freshSnapshotEvents);
 
-  // Grouped live update: new events and/or a score change in one post.
-  if (members.length > 0 || scoreChanged) {
+  /**
+   * Penalty-shootout kicks: while the shootout is in progress (status P) the
+   * match score no longer changes - shootout progress is reported through
+   * score.penalty (shootout_update). Goal events during P are shootout kicks,
+   * not match goals, and must not be published as goals.
+   */
+  if (nextShort === "P") {
+    members = members.filter((m) => eventCategory(m.kind) !== "goal");
+  }
+
+  /**
+   * Disallowed goals: when API-Football reports a confirmed "Goal cancelled"
+   * VAR decision for a team at a minute, a goal event for that same team and
+   * minute must not also be published as a scored goal. The cancellation is
+   * confirmed by the provider, so suppressing the matching goal uses confirmed
+   * data rather than inference.
+   */
+  const disallowed = members.filter((m) => m.kind === "var_goal_disallowed");
+  if (disallowed.length > 0) {
+    members = members.filter((m) => {
+      if (eventCategory(m.kind) !== "goal") return true;
+      return !disallowed.some(
+        (d) => d.teamName === m.teamName && d.minute === m.minute,
+      );
+    });
+  }
+
+  /**
+   * CATEGORY SPLITTING.
+   * Events of different categories are never mixed in one post: goals (with
+   * assists), cards, substitutions, missed penalties and VAR decisions each
+   * produce their own post. Within a category the existing grouping is kept -
+   * several goals still share one post, as do several cards or substitutions.
+   * VAR decisions are split per incident because separate VAR incidents are
+   * unrelated to one another.
+   */
+  const buckets = new Map<string, UpdateMember[]>();
+  for (const member of members) {
+    const category = eventCategory(member.kind);
+    if (category === "var") {
+      buckets.set(`var:${member.key}`, [member]);
+    } else {
+      buckets.set(category, [...(buckets.get(category) ?? []), member]);
+    }
+  }
+
+  // The score line belongs with the goal update; a score change with no goal
+  // event still produces a score-only update (existing behaviour).
+  const goalBucket = buckets.get("goal");
+  if (goalBucket) {
     candidates.push(
-      liveUpdateCandidate(fixture, members, { scoreChanged, prevHome, prevAway }),
+      liveUpdateCandidate(fixture, goalBucket, { scoreChanged, prevHome, prevAway }),
+    );
+  } else if (scoreChanged) {
+    candidates.push(
+      liveUpdateCandidate(fixture, [], { scoreChanged, prevHome, prevAway }),
+    );
+  }
+  for (const [bucketKey, bucketMembers] of buckets) {
+    if (bucketKey === "goal") continue;
+    candidates.push(
+      liveUpdateCandidate(fixture, bucketMembers, { scoreChanged: false, prevHome, prevAway }),
     );
   }
 
@@ -477,6 +547,34 @@ export const MILESTONE_KINDS: ReadonlySet<CandidateKind> = new Set<CandidateKind
 
 export function isMilestoneKind(kind: CandidateKind): boolean {
   return MILESTONE_KINDS.has(kind);
+}
+
+/**
+ * Event category for grouping. Only events of the SAME category may share a
+ * post: goals (with their assists), cards, substitutions, missed penalties and
+ * VAR decisions. VAR decisions are additionally split per incident, because
+ * separate VAR incidents are unrelated to one another.
+ */
+export type EventCategory = "goal" | "card" | "substitution" | "penalty" | "var";
+
+export function eventCategory(kind: MemberKind): EventCategory {
+  switch (kind) {
+    case "goal":
+    case "penalty_goal":
+    case "own_goal":
+      return "goal";
+    case "yellow_card":
+    case "red_card":
+      return "card";
+    case "substitution":
+      return "substitution";
+    case "missed_penalty":
+      return "penalty";
+    default:
+      // Every VAR outcome (upgrade, goal cancelled/awarded, penalty
+      // awarded/overturned, generic review).
+      return "var";
+  }
 }
 
 /** Event kinds that deserve their own post rather than being grouped. */

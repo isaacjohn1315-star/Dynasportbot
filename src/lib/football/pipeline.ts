@@ -475,10 +475,16 @@ export async function runAutomation(): Promise<AutomationSummary> {
     const unique = new Map<string, CandidateEvent>();
     for (const c of candidates) {
       if (c.kind === "live_update") {
-        // Grouped updates are keyed at claim time; keep the richest copy.
-        const existing = unique.get(`live_update:${c.fixtureId}`);
+        // Keyed per event CATEGORY so a fixture's goal, card, substitution,
+        // penalty and VAR updates are never collapsed into one another. VAR
+        // candidates are per-incident, so their key also carries the incident
+        // (first member key) - otherwise two unrelated VAR decisions would be
+        // collapsed into a single post.
+        const incident = (c.category ?? "goal") === "var" ? `:${c.members?.[0]?.key ?? ""}` : "";
+        const catKey = `live_update:${c.fixtureId}:${c.category ?? "goal"}${incident}`;
+        const existing = unique.get(catKey);
         if (!existing || (c.members?.length ?? 0) > (existing.members?.length ?? 0)) {
-          unique.set(`live_update:${c.fixtureId}`, c);
+          unique.set(catKey, c);
         }
       } else if (!unique.has(c.eventKey)) {
         unique.set(c.eventKey, c);
@@ -493,7 +499,13 @@ export async function runAutomation(): Promise<AutomationSummary> {
      */
     for (const candidate of [...unique.values()]) {
       if (candidate.kind !== "fulltime") continue;
-      const liveKey = `live_update:${candidate.fixtureId}`;
+      /**
+       * Only the GOAL category merges into the full-time post ("FT with the
+       * final goal beneath"). Cards, substitutions and VAR decisions detected
+       * in the same run remain their own category posts - mixing them into the
+       * FT post would violate the category-grouping rule.
+       */
+      const liveKey = `live_update:${candidate.fixtureId}:goal`;
       const live = unique.get(liveKey);
       if (!live) continue;
       const merged = [...(candidate.members ?? []), ...(live.members ?? [])];

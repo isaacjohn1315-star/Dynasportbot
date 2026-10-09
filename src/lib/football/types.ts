@@ -206,6 +206,12 @@ export interface CandidateEvent {
   statusShort: string | null;
   /** Timeline events belonging to this score update (live_update only). */
   members?: UpdateMember[];
+  /**
+   * Event category of a live_update ("goal" | "card" | "substitution" |
+   * "penalty" | "var"). Events of different categories are NEVER mixed in one
+   * post; each category produces its own post.
+   */
+  category?: string;
   /** True when the score changed since the stored snapshot. */
   scoreChanged?: boolean;
   /** First time this fixture is seen in-play (Tier 1 "now tracking" post). */
