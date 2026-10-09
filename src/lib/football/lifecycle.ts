@@ -33,6 +33,20 @@ const TERMINAL_STATUSES = new Set(["FT", "AET", "PEN", "PST", "CANC", "ABD", "AW
 const NOT_STARTED_STATUSES = new Set(["TBD", "NS"]);
 const IN_PLAY_STATUSES = new Set(["1H", "2H", "ET", "BT", "P", "INT", "SUSP", "LIVE"]);
 
+/**
+ * True when the fixture kicked off recently enough that publishing its final
+ * result is still meaningful (and a backlog after downtime cannot flood the
+ * page). Unparseable kickoff times are treated as stale - never guessed.
+ */
+export function isRecentKickoff(fixture: ApiFixture, maxAgeHours = 6): boolean {
+  const date = fixture?.fixture?.date;
+  if (typeof date !== "string" || !date) return false;
+  const kickoff = Date.parse(date);
+  if (!Number.isFinite(kickoff)) return false;
+  const ageMs = Date.now() - kickoff;
+  return ageMs >= 0 && ageMs <= maxAgeHours * 60 * 60 * 1000;
+}
+
 export function shortStatus(fixture: ApiFixture): string | null {
   const short = fixture.fixture?.status?.short;
   return typeof short === "string" && short.trim() ? short.trim().toUpperCase() : null;
@@ -119,31 +133,97 @@ function parseFlagCode(flagUrl: string | null | undefined): string | null {
   return match ? match[1].toLowerCase() : null;
 }
 
-export function eventIdentityKey(event: ApiFixtureEvent): string {
-  const type = norm(event.type);
-  const parts = [
-    type,
-    norm(event.team?.name),
-    event.time?.elapsed ?? "",
-    event.time?.extra ?? "",
-    norm(event.player?.name),
-    norm(event.assist?.name),
-  ];
-  /**
-   * API-Football refines VAR descriptions in place (e.g. "Goal cancelled"
-   * later becomes "Goal Disallowed - offside"). Including the volatile detail
-   * would mint a new key and publish the same decision twice, so VAR identity
-   * deliberately excludes it: one decision per team per minute.
-   */
-  if (type !== "var") parts.push(norm(event.detail));
-  return parts.join("|");
+/**
+ * STABLE event identity - the backbone of duplicate prevention.
+ *
+ * The previous key hashed raw API fields (assist name, player display name,
+ * elapsed and extra separately, and the detail text). API-Football refines
+ * events IN PLACE after first publishing them:
+ *   - an assist is often added a few minutes after the goal
+ *   - player names are normalised ("K. Havertz" -> "Kai Havertz")
+ *   - injury time is normalised (elapsed 90 + extra 3 -> elapsed 93)
+ *   - VAR wording is refined ("Goal cancelled" -> "Goal Disallowed - offside")
+ * Any of those minted a NEW key, so the SAME goal/card/VAR was posted twice.
+ *
+ * The identity is therefore built ONLY from stable facts:
+ *   classified kind + team + player SURNAME + total minute.
+ * The classified kind is stable because it maps reworded details to the same
+ * outcome, and the surname is stable across first-initial/name changes.
+ */
+function surnameOf(playerName: string | null | undefined): string {
+  const name = norm(playerName);
+  if (!name) return "";
+  const words = name.split(" ").filter(Boolean);
+  return words[words.length - 1] ?? name;
+}
+
+function totalMinuteOf(minute: number | null | undefined, extra: number | null | undefined): string {
+  if (minute == null || !Number.isFinite(minute)) return "";
+  return String(minute + (extra ?? 0));
+}
+
+/** Classify an API event into its stable DynaSport kind. */
+export function classifyEventKind(type: string, detail: string): MemberKind | null {
+  const t = norm(type);
+  const d = norm(detail);
+  if (t === "goal") {
+    if (d.includes("missed penalty")) return "missed_penalty";
+    if (d.includes("own goal")) return "own_goal";
+    if (d.includes("penalty")) return "penalty_goal";
+    return "goal";
+  }
+  if (t === "card") {
+    return d.includes("red") || d.includes("second yellow") ? "red_card" : "yellow_card";
+  }
+  if (t === "subst") return "substitution";
+  if (t === "var") {
+    if (d.includes("card upgraded") || d.includes("red card")) return "var_red_upgrade";
+    if (d.includes("goal cancelled") || d.includes("goal disallowed")) return "var_goal_disallowed";
+    if (d.includes("goal confirmed") || d.includes("goal awarded")) return "var_goal_awarded";
+    if (d.includes("penalty cancelled") || d.includes("penalty disallowed") || d.includes("penalty overturned")) return "var_penalty_overturned";
+    if (d.includes("penalty confirmed") || d.includes("penalty awarded")) return "var_penalty_awarded";
+    return "var_review";
+  }
+  // Corners, statistics and unknown incident types are never published.
+  return null;
+}
+
+/** Stable identity for a raw API-Football event. */
+export function stableEventIdentity(
+  type: string | null | undefined,
+  detail: string | null | undefined,
+  teamName: string | null | undefined,
+  playerName: string | null | undefined,
+  minute: number | null | undefined,
+  extra: number | null | undefined,
+): string {
+  const kind = classifyEventKind(type ?? "", detail ?? "");
+  if (!kind) return "";
+  return [kind, norm(teamName), surnameOf(playerName), totalMinuteOf(minute, extra)].join("|");
+}
+
+/** Stable identity computed from a stored snapshot event (raw fields kept). */
+function identityOfSnapshotEvent(event: SnapshotEvent): string {
+  return stableEventIdentity(event?.type, event?.detail, event?.teamName, event?.player, event?.minute, event?.extra);
+}
+
+/** Stable identity computed from a fresh API event. */
+function identityOfApiEvent(event: ApiFixtureEvent): string {
+  return stableEventIdentity(
+    typeof event?.type === "string" ? event.type : "",
+    typeof event?.detail === "string" ? event.detail : "",
+    event?.team?.name,
+    event?.player?.name,
+    typeof event?.time?.elapsed === "number" ? event.time.elapsed : null,
+    typeof event?.time?.extra === "number" ? event.time.extra : null,
+  );
 }
 
 function toSnapshotEvent(event: ApiFixtureEvent): SnapshotEvent {
   const elapsed = event.time?.elapsed;
   const extra = event.time?.extra;
   return {
-    key: eventIdentityKey(event),
+    key: identityOfApiEvent(event),
     type: typeof event.type === "string" ? event.type : "",
     detail: typeof event.detail === "string" ? event.detail : "",
     minute: typeof elapsed === "number" && Number.isFinite(elapsed) ? elapsed : null,
@@ -302,7 +382,7 @@ export function toUpdateMember(event: SnapshotEvent): UpdateMember | null {
 }
 
 function memberKey(fixtureId: number, event: SnapshotEvent): string {
-  return `fx${fixtureId}:ev:${event.key}`;
+  return `fx${fixtureId}:ev:${identityOfSnapshotEvent(event)}`;
 }
 
 function toMembers(fixtureId: number, events: SnapshotEvent[]): UpdateMember[] {
@@ -383,6 +463,22 @@ export function diffFixture(
     // First time this fixture appears in the live heartbeat.
     const members = toMembers(id, nextEvents);
 
+    /**
+     * FULL-TIME RECOVERY (first seen already finished).
+     *
+     * Finished fixtures leave "/fixtures?live=all" roughly 5-20 minutes after
+     * the final whistle, so a match that ends between two 15-minute polls is
+     * often FIRST seen in a terminal state. Previously this branch produced
+     * nothing for terminal statuses, so those full-times were never posted.
+     * The confirmed final status is now published, bounded by a freshness
+     * window so a long outage cannot flood the page with stale results.
+     */
+    if (nextShort && isTerminalStatus(nextShort) && isRecentKickoff(fixture)) {
+      const finalPost = statusCandidate(fixture, nextShort);
+      if (finalPost) candidates.push(finalPost);
+      return finish(candidates);
+    }
+
     if (nextShort === "1H" && (elapsed == null || elapsed <= EARLY_KICKOFF_WINDOW_MINUTES) && nextHome === 0 && nextAway === 0) {
       const kickoff = baseCandidate(fixture, "kickoff", 0, -5);
       kickoff.eventKey = `fx${id}:kickoff`;
@@ -432,8 +528,16 @@ export function diffFixture(
    * the whole fixture and silently lost its milestones (including FT).
    */
   const previousEvents = Array.isArray(previous.events) ? previous.events : [];
-  const previousKeys = new Set(previousEvents.map((e) => e?.key).filter(Boolean));
-  const freshSnapshotEvents = nextEvents.filter((e) => !previousKeys.has(e.key));
+  /**
+   * Compare by STABLE identity computed from the raw fields on BOTH sides, so
+   * a previously stored event is still recognised after the provider refines
+   * its assist, player name, minute or detail wording. This is what prevents
+   * the same goal being posted twice.
+   */
+  const previousIdentities = new Set(
+    previousEvents.map((e) => identityOfSnapshotEvent(e)).filter((k) => k.length > 0),
+  );
+  const freshSnapshotEvents = nextEvents.filter((e) => !previousIdentities.has(identityOfSnapshotEvent(e)));
   let members = toMembers(id, freshSnapshotEvents);
 
   /**

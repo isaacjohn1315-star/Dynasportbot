@@ -60,11 +60,17 @@ export function formatMemberGroup(m: UpdateMember): string[] {
   const minute = minuteOf(m);
   const time = minute ? ` (${minute}${MIN})` : "";
   const who = (m.player ?? "").trim();
+  /**
+   * Team indicator: appended to every event line so readers can see which
+   * team the event belongs to. Sourced from the API's own event team; when
+   * the provider supplies no team, the bracket is omitted rather than guessed.
+   */
+  const teamTag = (m.teamName ?? "").trim() ? ` [${(m.teamName ?? "").trim()}]` : "";
 
   switch (m.kind) {
     case "goal": {
       if (!who) return [];
-      const lines = [`⚽️ Goal: ${who}${time}`];
+      const lines = [`⚽️ Goal: ${who}${time}${teamTag}`];
       if (m.assist) lines.push(`🎯 ${m.assist}`);
       return lines;
     }
@@ -75,41 +81,41 @@ export function formatMemberGroup(m: UpdateMember): string[] {
        * ("(48' pen)"), never as the main event label.
        */
       return who
-        ? [`⚽️ Goal: ${who}${minute ? ` (${minute}${MIN} pen)` : " (pen)"}`]
+        ? [`⚽️ Goal: ${who}${minute ? ` (${minute}${MIN} pen)` : " (pen)"}${teamTag}`]
         : [];
     case "own_goal":
-      return who ? [`⚽️ Own Goal: ${who}${time}`] : [];
+      return who ? [`⚽️ Own Goal: ${who}${time}${teamTag}`] : [];
     case "missed_penalty":
-      return who ? [`❌ Penalty Missed: ${who}${time}`] : [];
+      return who ? [`❌ Penalty Missed: ${who}${time}${teamTag}`] : [];
     case "yellow_card":
-      return who ? [`🟨 Yellow Card: ${who}${time}`] : [];
+      return who ? [`🟨 Yellow Card: ${who}${time}${teamTag}`] : [];
     case "red_card":
-      return who ? [`🟥 Red Card: ${who}${time}`] : [];
+      return who ? [`🟥 Red Card: ${who}${time}${teamTag}`] : [];
     case "substitution": {
       const off = (m.player ?? "").trim();
       const on = (m.assist ?? "").trim();
-      if (off && on) return [`🔄 Substitution: ${on} replaces ${off}${time}`];
+      if (off && on) return [`🔄 Substitution: ${on} replaces ${off}${time}${teamTag}`];
       return [];
     }
     /* ------------------------------ VAR outcomes ------------------------------ */
     case "var_red_upgrade":
       // Yellow upgraded to red after review. Only claimed when the provider
       // explicitly reports the upgrade.
-      return who ? [`🟥 Red Card (VAR upgrade): ${who}${time}`] : [];
+      return who ? [`🟥 Red Card (VAR upgrade): ${who}${time}${teamTag}`] : [];
     case "var_goal_disallowed":
-      return [`🚫 Goal disallowed after VAR${who ? `: ${who}` : ""}${time}`];
+      return [`🚫 Goal disallowed after VAR${who ? `: ${who}` : ""}${time}${teamTag}`];
     case "var_goal_awarded":
-      return [`⚽️ Goal awarded after VAR${who ? `: ${who}` : ""}${time}`];
+      return [`⚽️ Goal awarded after VAR${who ? `: ${who}` : ""}${time}${teamTag}`];
     case "var_penalty_awarded":
-      return [`⚖️ Penalty awarded after VAR${who ? `: ${who}` : ""}${time}`];
+      return [`⚖️ Penalty awarded after VAR${who ? `: ${who}` : ""}${time}${teamTag}`];
     case "var_penalty_overturned":
-      return [`⚖️ Penalty overturned after VAR${who ? `: ${who}` : ""}${time}`];
+      return [`⚖️ Penalty overturned after VAR${who ? `: ${who}` : ""}${time}${teamTag}`];
     case "var_review": {
       // No confirmed outcome: publish only if the provider supplied readable
       // text, and never assert that a decision changed.
       const detail = (m.detail ?? "").trim();
       if (!detail) return [];
-      return [`📺 VAR review: ${detail}${time}`];
+      return [`📺 VAR review: ${detail}${time}${teamTag}`];
     }
     default:
       return [];
