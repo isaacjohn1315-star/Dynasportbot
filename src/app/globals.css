@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #06090b;
+}
+
+.grid-texture {
+  background-image:
+    linear-gradient(rgba(163, 230, 53, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(163, 230, 53, 0.045) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+::selection {
+  background: rgba(163, 230, 53, 0.25);
+}
