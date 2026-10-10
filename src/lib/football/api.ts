@@ -311,18 +311,34 @@ export function embeddedLineups(fixture: ApiFixture): ApiLineup[] {
  * How many detail requests this run may spend without starving the heartbeat:
  * today's remaining budget minus the heartbeat slots still needed before UTC midnight.
  */
-export async function detailSlotsAvailable(sql: Sql): Promise<number> {
+async function usedRequestsToday(sql: Sql): Promise<number> {
   const day = utcDay();
   await sql`insert into api_usage (day) values (${day}) on conflict (day) do nothing`;
   const rows = (await sql`select requests_total from api_usage where day = ${day}`) as {
     requests_total: number | string;
   }[];
-  const used = Number(rows[0]?.requests_total ?? 0);
+  return Number(rows[0]?.requests_total ?? 0);
+}
+
+export async function detailSlotsAvailable(sql: Sql): Promise<number> {
+  const used = await usedRequestsToday(sql);
   // Reserve every heartbeat still due before the 00:00 UTC quota reset, plus
-  // a configurable safety reserve for recovery work.
+  // a configurable safety reserve for finish recovery work.
   const heartbeatReserve = Math.ceil(secondsUntilUtcMidnight() / HEARTBEAT_INTERVAL_SECONDS);
   const remainingForDetail = dailyBudget() - used - heartbeatReserve - safetyReserve();
   return Math.max(0, Math.min(remainingForDetail, detailMaxBatchesPerRun()));
+}
+
+/**
+ * Critical recovery allowance. It may use the configured safety reserve, but
+ * never a future heartbeat slot and never the hard 100/day cap. Used only for
+ * authoritative final-status confirmation after a fixture leaves live=all.
+ */
+export async function criticalDetailSlotsAvailable(sql: Sql): Promise<number> {
+  const used = await usedRequestsToday(sql);
+  const heartbeatReserve = Math.ceil(secondsUntilUtcMidnight() / HEARTBEAT_INTERVAL_SECONDS);
+  const remaining = dailyBudget() - used - heartbeatReserve;
+  return Math.max(0, Math.min(remaining, detailMaxBatchesPerRun()));
 }
 
 export interface UsageToday {

@@ -3,6 +3,7 @@ import {
   FacebookConfigError,
   FacebookPermanentError,
   FacebookPostError,
+  FacebookUncertainError,
 } from "./errors";
 import { validateMessage } from "./validate";
 
@@ -62,8 +63,11 @@ export async function postToFacebookPage(message: string): Promise<FacebookPostR
       signal: AbortSignal.timeout(20000),
     });
   } catch (error) {
-    throw new FacebookPostError(
-      `Facebook Graph request failed: ${error instanceof Error ? error.message : String(error)}`,
+    // The POST may have reached Facebook before the transport failed. Retrying
+    // blindly can create a duplicate, so mark the outcome uncertain and
+    // reconcile against the Page feed first.
+    throw new FacebookUncertainError(
+      `Facebook Graph publish outcome unknown: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 
@@ -95,6 +99,12 @@ export async function postToFacebookPage(message: string): Promise<FacebookPostR
      * valid Page access token - so the event must stay queued, not be retired.
      */
     const code = typeof err?.code === "number" ? err.code : null;
+    // Meta code 506 means duplicate content. A matching post likely exists;
+    // reconcile the Page feed instead of retrying or marking this delivered
+    // without a post ID.
+    if (code === 506) {
+      throw new FacebookUncertainError(detail);
+    }
     const authCode =
       code === 190 ||
       code === 102 ||
@@ -119,4 +129,69 @@ export async function postToFacebookPage(message: string): Promise<FacebookPostR
   }
 
   return { id };
+}
+
+export interface FacebookFeedPost {
+  id: string;
+  message: string;
+  createdTime: string | null;
+}
+
+/**
+ * Read recent posts from the configured Page for uncertain-outcome
+ * reconciliation. This is called only when a publish transport failed.
+ */
+export async function getRecentFacebookPagePosts(limit = 50): Promise<FacebookFeedPost[]> {
+  const pageId = process.env.FACEBOOK_PAGE_ID;
+  const pageAccessToken = process.env.FACEBOOK_PAGE_ACCESS_TOKEN;
+  if (!pageId || !pageAccessToken) {
+    throw new FacebookConfigError(
+      "FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN must both be configured",
+    );
+  }
+
+  const url = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/feed`);
+  url.searchParams.set("fields", "id,message,created_time");
+  url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 100))));
+  url.searchParams.set("access_token", pageAccessToken);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (error) {
+    throw new FacebookPostError(
+      `Facebook reconciliation request failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const payload = (await response.json().catch(() => null)) as {
+    data?: Array<{ id?: unknown; message?: unknown; created_time?: unknown }>;
+    error?: GraphErrorShape["error"];
+  } | null;
+
+  if (!response.ok || payload?.error) {
+    const code = payload?.error?.code;
+    const detail = `Facebook feed reconciliation error (${response.status})${
+      typeof code === "number" ? ` code=${code}` : ""
+    }: ${(payload?.error?.message ?? "unknown").slice(0, 240)}`;
+    if (code === 190 || code === 102 || code === 10 || response.status === 403) {
+      throw new FacebookAuthError(detail);
+    }
+    throw new FacebookPostError(detail);
+  }
+
+  if (!Array.isArray(payload?.data)) return [];
+  return payload.data.flatMap((post) => {
+    if (typeof post.id !== "string" || typeof post.message !== "string") return [];
+    return [{
+      id: post.id,
+      message: post.message,
+      createdTime: typeof post.created_time === "string" ? post.created_time : null,
+    }];
+  });
 }

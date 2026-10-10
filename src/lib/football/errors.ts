@@ -26,6 +26,13 @@ export class ApiAccountError extends DynaSportError {}
 export class FacebookAuthError extends FacebookPostError {}
 
 /**
+ * Transport failure after a Graph POST was started. The outcome is unknown:
+ * Facebook may have created the post even though no response reached us.
+ * Never retry blindly; reconcile the Page feed first.
+ */
+export class FacebookUncertainError extends FacebookPostError {}
+
+/**
  * Genuinely undeliverable: the content itself is invalid. Retrying can never
  * help, so these are retired permanently.
  */
@@ -68,6 +75,7 @@ export function redactSecrets(input: string): string {
 export function isRetryable(error: unknown): boolean {
   if (error instanceof ApiAccountError) return false;
   if (error instanceof FacebookAuthError) return false;
+  if (error instanceof FacebookUncertainError) return false;
   if (error instanceof FacebookPermanentError) return false;
   if (error instanceof ConfigError) return false;
   if (error instanceof FacebookConfigError) return false;
@@ -78,6 +86,11 @@ export function isRetryable(error: unknown): boolean {
 /** Credential problem: pause delivery, keep the event queued for later. */
 export function isAuthFailure(error: unknown): boolean {
   return error instanceof FacebookAuthError || error instanceof FacebookConfigError;
+}
+
+/** POST result is unknown: reconcile before any retry. */
+export function isUncertainFailure(error: unknown): boolean {
+  return error instanceof FacebookUncertainError;
 }
 
 /** Content can never be delivered: retire it permanently. */

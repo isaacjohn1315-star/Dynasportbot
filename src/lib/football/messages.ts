@@ -32,8 +32,21 @@ function buildPost(statusLine: string, groups: string[][]): string {
   return parts.join("\n\n").replace(/[ \t]+$/gm, "");
 }
 
+function hasVerifiedScore(c: CandidateEvent): boolean {
+  return (
+    c.scoreKnown !== false &&
+    typeof c.goalsHome === "number" &&
+    typeof c.goalsAway === "number" &&
+    Number.isFinite(c.goalsHome) &&
+    Number.isFinite(c.goalsAway)
+  );
+}
+
+/** Verified score, or the teams only. Never fabricates a 0-0 from null data. */
 function scoreOf(c: CandidateEvent): string {
-  return `${c.home} ${c.goalsHome ?? 0}-${c.goalsAway ?? 0} ${c.away}`;
+  return hasVerifiedScore(c)
+    ? `${c.home} ${c.goalsHome}-${c.goalsAway} ${c.away}`
+    : `${c.home} vs ${c.away}`;
 }
 
 function pensOf(c: CandidateEvent): string {
@@ -42,6 +55,12 @@ function pensOf(c: CandidateEvent): string {
 
 function versusOf(c: CandidateEvent): string {
   return `${c.home} vs ${c.away}`;
+}
+
+/** Source-verified team marker for match statuses (never inferred). */
+function affectedTeamTag(c: CandidateEvent): string {
+  const team = (c.affectedTeam ?? "").trim();
+  return team ? ` [${team}]` : "";
 }
 
 /** Minute text, preserving injury time: 90+4 stays 90+4. */
@@ -216,6 +235,8 @@ export function buildLineupPostData(
  * always meaningful on their own.
  */
 export function hasPublishableContent(c: CandidateEvent): boolean {
+  // A final result without a verified score is not a result - do not publish.
+  if (c.kind === "fulltime" && !hasVerifiedScore(c)) return false;
   if (c.kind !== "live_update") return true;
   if (memberGroups(c).length > 0) return true;
   // No renderable events: only worth posting if the score itself changed.
@@ -259,11 +280,20 @@ export function composeMessage(c: CandidateEvent): string {
       return buildPost(`🚩 Penalty Shootout: ${pensOf(c)}`, []);
 
     case "fulltime": {
-      // FT status first; a not-yet-published final goal(s) beneath it.
-      const groups = memberGroups(c);
-      const isPens = c.statusShort?.toUpperCase() === "PEN" && c.pensHome != null && c.pensAway != null;
-      if (isPens) groups.push([`⚽️ Penalties: ${pensOf(c)}`]);
-      return buildPost(`🚩 FT: ${scoreOf(c)}`, groups);
+      /**
+       * Full-time is published on its own, with no event lines merged in.
+       * A goal detected in the same run is posted separately in the normal
+       * goal format with the score at that goal's minute.
+       * A penalty-shootout result is part of the final outcome, so it is the
+       * only line that may accompany the FT status - and only when the API
+       * confirmed the shootout tally.
+       */
+      const isShootout =
+        c.statusShort?.toUpperCase() === "PEN" && c.pensHome != null && c.pensAway != null;
+      return buildPost(
+        `🚩 FT: ${scoreOf(c)}`,
+        isShootout ? [[`⚽️ Penalties: ${pensOf(c)}`]] : [],
+      );
     }
 
     case "postponed":
@@ -282,10 +312,10 @@ export function composeMessage(c: CandidateEvent): string {
       return buildPost(`🚩 Interrupted: ${scoreOf(c)}`, []);
 
     case "awarded":
-      return buildPost(`🚩 Awarded: ${scoreOf(c)}`, []);
+      return buildPost(`🚩 Awarded: ${scoreOf(c)}${affectedTeamTag(c)}`, []);
 
     case "walkover":
-      return buildPost(`🚩 Walkover: ${versusOf(c)}`, []);
+      return buildPost(`🚩 Walkover: ${versusOf(c)}${affectedTeamTag(c)}`, []);
 
     default:
       return buildPost(`🚩 Live: ${scoreOf(c)}`, memberGroups(c));

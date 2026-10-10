@@ -103,6 +103,10 @@ export interface SnapshotEvent {
 export interface FixtureSnapshot {
   fixtureId: number;
   kickoffAt: string | null;
+  /** Stable API-Football competition ID, needed to re-verify dropped fixtures. */
+  leagueId?: number | null;
+  /** When this snapshot was recorded (diagnostics and recovery ordering). */
+  lastSeenAt?: string | null;
   leagueName: string;
   leagueCountry: string | null;
   leagueFlagCode: string | null;
@@ -112,6 +116,8 @@ export interface FixtureSnapshot {
   elapsed: number | null;
   goalsHome: number | null;
   goalsAway: number | null;
+  /** True when the displayed score comes from the API or a previously confirmed snapshot. */
+  scoreKnown?: boolean;
   pensHome: number | null;
   pensAway: number | null;
   events: SnapshotEvent[];
@@ -201,9 +207,17 @@ export interface CandidateEvent {
   away: string;
   goalsHome: number | null;
   goalsAway: number | null;
+  /** True when the displayed score comes from the API or a previously confirmed snapshot. */
+  scoreKnown?: boolean;
   pensHome: number | null;
   pensAway: number | null;
   statusShort: string | null;
+  /**
+   * Team explicitly identified by the API as affected/winner for a status
+   * such as awarded or walkover. Null/undefined means the provider did not
+   * identify one, so the formatter must not guess.
+   */
+  affectedTeam?: string | null;
   /** Timeline events belonging to this score update (live_update only). */
   members?: UpdateMember[];
   /**

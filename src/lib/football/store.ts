@@ -65,6 +65,10 @@ export async function ensureSchema(sql: Sql): Promise<void> {
   // status. We never invent a result for these; they are surfaced instead.
   await sql`alter table fixture_state add column if not exists unresolved boolean not null default false`;
 
+  // Links internal event-member claims to the complete Facebook post row. This
+  // makes unknown-outcome reconciliation exact and non-destructive.
+  await sql`alter table posted_events add column if not exists parent_key text`;
+
   await sql`
     create table if not exists system_events (
       id bigint generated always as identity primary key,
@@ -221,6 +225,46 @@ export async function markEventFailed(sql: Sql, eventKey: string, error: unknown
     where event_key = ${eventKey}`;
 }
 
+/** Unknown Graph POST outcome: do not retry until feed reconciliation. */
+export async function markEventUncertain(sql: Sql, eventKey: string, error: unknown): Promise<void> {
+  await sql`
+    update posted_events
+    set status = 'uncertain',
+        last_error = ${errorMessage(error)},
+        updated_at = now()
+    where event_key = ${eventKey} and status <> 'posted'`;
+}
+
+export interface UncertainEvent {
+  eventKey: string;
+  fixtureId: number;
+  kind: string;
+  message: string;
+  updatedAt: string;
+}
+
+export async function loadUncertainEvents(sql: Sql, limit = 50): Promise<UncertainEvent[]> {
+  const rows = (await sql`
+    select event_key, fixture_id, kind, message, updated_at
+    from posted_events
+    where status = 'uncertain'
+    order by updated_at asc
+    limit ${Math.max(1, Math.min(limit, 100))}`) as {
+    event_key: string;
+    fixture_id: number | string;
+    kind: string;
+    message: string;
+    updated_at: string;
+  }[];
+  return rows.map((row) => ({
+    eventKey: row.event_key,
+    fixtureId: Number(row.fixture_id),
+    kind: row.kind,
+    message: row.message,
+    updatedAt: row.updated_at,
+  }));
+}
+
 /* ----------------------- Grouped update member claiming ----------------------- */
 
 /** Current bookkeeping status for a set of event keys. */
@@ -280,7 +324,7 @@ export async function markKeysPosted(sql: Sql, keys: string[], fbPostId: string)
           last_error = null,
           posted_at = now(),
           updated_at = now()
-      where event_key = ${key} and status = 'claimed'`;
+      where event_key = ${key} and status in ('claimed', 'uncertain')`;
   }
 }
 
@@ -305,6 +349,66 @@ export async function markKeysFailed(sql: Sql, keys: string[], error: unknown): 
   }
 }
 
+export async function markKeysUncertain(sql: Sql, keys: string[], error: unknown): Promise<void> {
+  const message = errorMessage(error);
+  for (const key of keys) {
+    await sql`
+      update posted_events
+      set status = 'uncertain', last_error = ${message}, updated_at = now()
+      where event_key = ${key} and status = 'claimed'`;
+  }
+}
+
+/** Reconciliation confirmed no Page post: release member rows for retry. */
+export async function releaseUncertainKeys(sql: Sql, keys: string[]): Promise<void> {
+  for (const key of keys) {
+    await sql`
+      update posted_events
+      set status = 'failed',
+          last_error = 'Facebook feed reconciliation found no matching post',
+          updated_at = now()
+      where event_key = ${key} and status = 'uncertain'`;
+  }
+}
+
+export async function linkMemberKeysToParent(
+  sql: Sql,
+  keys: string[],
+  parentKey: string,
+): Promise<void> {
+  for (const key of keys) {
+    await sql`
+      update posted_events
+      set parent_key = ${parentKey}, updated_at = now()
+      where event_key = ${key}`;
+  }
+}
+
+export async function loadChildEventKeys(sql: Sql, parentKey: string): Promise<string[]> {
+  const rows = (await sql`
+    select event_key from posted_events where parent_key = ${parentKey}`) as {
+    event_key: string;
+  }[];
+  return rows.map((row) => row.event_key);
+}
+
+/** Repair child claims after a confirmed parent was posted but child updates failed. */
+export async function reconcilePostedChildren(sql: Sql): Promise<number> {
+  const rows = (await sql`
+    update posted_events child
+    set status = 'posted',
+        fb_post_id = parent.fb_post_id,
+        last_error = null,
+        posted_at = coalesce(child.posted_at, parent.posted_at, now()),
+        updated_at = now()
+    from posted_events parent
+    where child.parent_key = parent.event_key
+      and parent.status = 'posted'
+      and child.status <> 'posted'
+    returning child.event_key`) as { event_key: string }[];
+  return rows.length;
+}
+
 /* --------------------- Stale claims + retry queue (no API cost) --------------------- */
 
 /**
@@ -316,8 +420,11 @@ export async function markKeysFailed(sql: Sql, keys: string[], error: unknown): 
 export async function reapStaleClaims(sql: Sql, olderThanMinutes = 10): Promise<number> {
   const rows = (await sql`
     update posted_events
-    set status = 'failed',
-        last_error = coalesce(last_error, 'claim expired before publishing'),
+    set status = 'uncertain',
+        last_error = coalesce(
+          last_error,
+          'claim expired with unknown delivery outcome; feed reconciliation required'
+        ),
         updated_at = now()
     where status = 'claimed'
       and updated_at < now() - (${olderThanMinutes} * interval '1 minute')
@@ -347,6 +454,14 @@ export async function loadRetryableEvents(sql: Sql, limit: number): Promise<Retr
       and (status = 'blocked' or attempts < ${MAX_EVENT_ATTEMPTS})
       and created_at > now() - interval '24 hours'
       and coalesce(last_error, '') not like 'PERMANENT:%'
+      -- Member rows are internal deduplication claims. Their message is only
+      -- one event line, not a complete valid Facebook post; only composite
+      -- candidate rows may enter the delivery retry queue.
+      and kind not in (
+        'goal','penalty_goal','own_goal','missed_penalty','yellow_card','red_card',
+        'substitution','var_red_upgrade','var_goal_disallowed','var_goal_awarded',
+        'var_penalty_awarded','var_penalty_overturned','var_review'
+      )
     -- Milestones (FT, HT, kick-off, shootout, terminal statuses) are retried
     -- before ordinary events: a backlog of old failed goals must never crowd
     -- a failed full-time post out of the limited retry window.

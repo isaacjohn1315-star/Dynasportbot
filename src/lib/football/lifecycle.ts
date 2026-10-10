@@ -235,6 +235,29 @@ function toSnapshotEvent(event: ApiFixtureEvent): SnapshotEvent {
   };
 }
 
+/**
+ * Add a deterministic occurrence suffix to identities that repeat in one
+ * fixture. Without this, two players with the same surname receiving the same
+ * event for the same team/minute collapse in a Set and one event is lost.
+ * API-Football's event order is chronological and stable within a response,
+ * making the occurrence number deterministic.
+ */
+function toSnapshotEvents(events: ApiFixtureEvent[]): SnapshotEvent[] {
+  const counts = new Map<string, number>();
+  return events.map((raw) => {
+    const event = toSnapshotEvent(raw);
+    const base = identityOfSnapshotEvent(event);
+    const occurrence = (counts.get(base) ?? 0) + 1;
+    counts.set(base, occurrence);
+    return { ...event, key: `${base}|occ:${occurrence}` };
+  });
+}
+
+/** Base identity, stripping the occurrence suffix from new snapshots. */
+function baseIdentity(event: SnapshotEvent): string {
+  return identityOfSnapshotEvent(event);
+}
+
 /** Tolerates partial fixtures: missing teams, league, score or events. */
 export function buildSnapshot(fixture: ApiFixture): FixtureSnapshot {
   const status = fixture.fixture?.status;
@@ -242,6 +265,8 @@ export function buildSnapshot(fixture: ApiFixture): FixtureSnapshot {
   return {
     fixtureId: fixture.fixture.id,
     kickoffAt: typeof fixture.fixture?.date === "string" ? fixture.fixture.date : null,
+    leagueId: typeof fixture.league?.id === "number" && Number.isFinite(fixture.league.id) ? fixture.league.id : null,
+    lastSeenAt: new Date().toISOString(),
     leagueName: safeName(fixture.league?.name, "Unknown competition"),
     leagueCountry: safeOptionalName(fixture.league?.country),
     leagueFlagCode: parseFlagCode(fixture.league?.flag),
@@ -253,7 +278,7 @@ export function buildSnapshot(fixture: ApiFixture): FixtureSnapshot {
     goalsAway: safeGoals(fixture.goals?.away),
     pensHome: safeGoals(fixture.score?.penalty?.home),
     pensAway: safeGoals(fixture.score?.penalty?.away),
-    events: safeEvents(fixture.events).map(toSnapshotEvent),
+    events: toSnapshotEvents(safeEvents(fixture.events)),
     lineupPosted: false,
     lastPostedScoreline: null,
   };
@@ -328,6 +353,16 @@ function statusCandidate(fixture: ApiFixture, short: string): CandidateEvent | n
   if (!kind) return null;
   const c = baseCandidate(fixture, kind, STATUS_SORT_MINUTES[short] ?? fixture.fixture.status.elapsed ?? null, 3);
   c.eventKey = `fx${fixture.fixture.id}:status:${short}`;
+  if (short === "AWD" || short === "WO") {
+    const homeWon = fixture.teams?.home?.winner === true;
+    const awayWon = fixture.teams?.away?.winner === true;
+    // Only one explicit winner is trustworthy. Ambiguous/missing data -> omit.
+    c.affectedTeam = homeWon !== awayWon
+      ? homeWon
+        ? safeName(fixture.teams?.home?.name, "")
+        : safeName(fixture.teams?.away?.name, "")
+      : null;
+  }
   return c;
 }
 
@@ -382,7 +417,10 @@ export function toUpdateMember(event: SnapshotEvent): UpdateMember | null {
 }
 
 function memberKey(fixtureId: number, event: SnapshotEvent): string {
-  return `fx${fixtureId}:ev:${identityOfSnapshotEvent(event)}`;
+  const identity = event.key && event.key.includes("|occ:")
+    ? event.key
+    : `${identityOfSnapshotEvent(event)}|occ:1`;
+  return `fx${fixtureId}:ev:${identity}`;
 }
 
 function toMembers(fixtureId: number, events: SnapshotEvent[]): UpdateMember[] {
@@ -441,14 +479,45 @@ export function diffFixture(
   const scoreUnknown = rawHome === null || rawAway === null;
   const nextHome = rawHome ?? previous?.goalsHome ?? 0;
   const nextAway = rawAway ?? previous?.goalsAway ?? 0;
-  const nextEvents = safeEvents(fixture.events).map(toSnapshotEvent);
+  const nextEvents = toSnapshotEvents(safeEvents(fixture.events));
   const candidates: CandidateEvent[] = [];
 
   /** Ensure every emitted candidate carries the resolved (never null) score. */
   const finish = (list: CandidateEvent[]): CandidateEvent[] =>
     sortCandidates(
-      list.map((c) => ({ ...c, goalsHome: c.goalsHome ?? nextHome, goalsAway: c.goalsAway ?? nextAway })),
+      list.map((c) => ({
+        ...c,
+        goalsHome: c.goalsHome ?? nextHome,
+        goalsAway: c.goalsAway ?? nextAway,
+        scoreKnown:
+          c.scoreKnown ??
+          (c.kind === "fulltime"
+            // A final result must carry its own final score. Never promote the
+            // previous live score to "verified" - a stoppage-time goal may be
+            // missing from that earlier snapshot.
+            ? !scoreUnknown
+            : !scoreUnknown ||
+              (previous?.goalsHome != null && previous?.goalsAway != null)),
+      })),
     );
+
+  /** Finish after assigning each event post the score at that moment. */
+  const finishScored = (
+    list: CandidateEvent[],
+    eventMembers: UpdateMember[],
+    previousHome: number | null,
+    previousAway: number | null,
+  ): CandidateEvent[] => {
+    applyRunningScores(list, eventMembers, {
+      prevHome: previousHome,
+      prevAway: previousAway,
+      actualHome: nextHome,
+      actualAway: nextAway,
+      home: safeName(fixture.teams?.home?.name, "Home"),
+      away: safeName(fixture.teams?.away?.name, "Away"),
+    });
+    return finish(list);
+  };
 
   /**
    * Tier 2 (low-interest) competitions are not covered by the platform.
@@ -476,7 +545,7 @@ export function diffFixture(
     if (nextShort && isTerminalStatus(nextShort) && isRecentKickoff(fixture)) {
       const finalPost = statusCandidate(fixture, nextShort);
       if (finalPost) candidates.push(finalPost);
-      return finish(candidates);
+      return finishScored(candidates, members, null, null);
     }
 
     if (nextShort === "1H" && (elapsed == null || elapsed <= EARLY_KICKOFF_WINDOW_MINUTES) && nextHome === 0 && nextAway === 0) {
@@ -513,7 +582,7 @@ export function diffFixture(
         );
       }
     }
-    return finish(candidates);
+    return finishScored(candidates, members, null, null);
   }
 
   const prevShort = (previous.statusShort ?? "").toUpperCase();
@@ -534,10 +603,22 @@ export function diffFixture(
    * its assist, player name, minute or detail wording. This is what prevents
    * the same goal being posted twice.
    */
-  const previousIdentities = new Set(
-    previousEvents.map((e) => identityOfSnapshotEvent(e)).filter((k) => k.length > 0),
-  );
-  const freshSnapshotEvents = nextEvents.filter((e) => !previousIdentities.has(identityOfSnapshotEvent(e)));
+  const previousCounts = new Map<string, number>();
+  for (const event of previousEvents) {
+    const identity = baseIdentity(event);
+    if (identity) previousCounts.set(identity, (previousCounts.get(identity) ?? 0) + 1);
+  }
+  const consumed = new Map<string, number>();
+  const freshSnapshotEvents = nextEvents.filter((event) => {
+    const identity = baseIdentity(event);
+    const used = consumed.get(identity) ?? 0;
+    const available = previousCounts.get(identity) ?? 0;
+    if (used < available) {
+      consumed.set(identity, used + 1);
+      return false;
+    }
+    return true;
+  });
   let members = toMembers(id, freshSnapshotEvents);
 
   /**
@@ -630,7 +711,7 @@ export function diffFixture(
     }
   }
 
-  return finish(candidates);
+  return finishScored(candidates, members, prevHome, prevAway);
 }
 
 /**
@@ -684,6 +765,95 @@ export function isPerIncidentKind(kind: MemberKind): boolean {
     default:
       // Goals and every VAR outcome are per-incident.
       return eventCategory(kind) === "goal" || eventCategory(kind) === "var";
+  }
+}
+
+/** Kinds that change the scoreboard. */
+function isScoringKind(kind: MemberKind): boolean {
+  return kind === "goal" || kind === "penalty_goal" || kind === "own_goal";
+}
+
+/**
+ * The side a scoring member counts FOR. An own goal by a player on team T
+ * counts for T's opponent. Returns null when the team cannot be matched, so
+ * the caller falls back instead of guessing.
+ */
+function scoringSide(member: UpdateMember, home: string, away: string): "home" | "away" | null {
+  const team = norm(member.teamName);
+  const h = norm(home);
+  const a = norm(away);
+  if (!team) return null;
+  if (h && team === h) return member.kind === "own_goal" ? "away" : "home";
+  if (a && team === a) return member.kind === "own_goal" ? "home" : "away";
+  return null;
+}
+
+/**
+ * Give every live_update candidate the score AS IT STOOD at that event,
+ * instead of the score at poll time.
+ *
+ * Root cause this fixes: the 15-minute heartbeat regularly delivers several
+ * goals at once. Every per-incident goal post previously carried the fixture's
+ * CURRENT score, so a 14' opener and a 23' equaliser arriving in the same poll
+ * BOTH printed "1-1" - impossible, and confusing to followers.
+ *
+ * The running score starts from the previous poll's score and replays the
+ * fresh scoring events chronologically. When the previous score is unknown
+ * (fixture first seen mid-match) it starts at 0-0 and is only used if it
+ * reconciles exactly with the reported score - otherwise the reported score is
+ * kept rather than guessing.
+ */
+function applyRunningScores(
+  list: CandidateEvent[],
+  members: UpdateMember[],
+  options: {
+    prevHome: number | null;
+    prevAway: number | null;
+    actualHome: number;
+    actualAway: number;
+    home: string;
+    away: string;
+  },
+): void {
+  const updates = list.filter((c) => c.kind === "live_update" && (c.members ?? []).length > 0);
+  if (updates.length === 0) return;
+
+  const scoring = members
+    .filter((m) => isScoringKind(m.kind))
+    .map((m) => ({ minute: m.minute ?? 0, side: scoringSide(m, options.home, options.away) }))
+    .filter((e): e is { minute: number; side: "home" | "away" } => e.side !== null)
+    .sort((a, b) => a.minute - b.minute);
+
+  const knownPrev = options.prevHome != null && options.prevAway != null;
+  const startHome = knownPrev ? (options.prevHome as number) : 0;
+  const startAway = knownPrev ? (options.prevAway as number) : 0;
+
+  let endHome = startHome;
+  let endAway = startAway;
+  for (const e of scoring) {
+    if (e.side === "home") endHome += 1;
+    else endAway += 1;
+  }
+  // Unknown baseline + mismatch => the event list is incomplete; publishing a
+  // reconstructed score would be a guess, so keep the reported one.
+  if (!knownPrev && (endHome !== options.actualHome || endAway !== options.actualAway)) return;
+
+  const scoreAt = (minute: number): { home: number; away: number } => {
+    let h = startHome;
+    let a = startAway;
+    for (const e of scoring) {
+      if (e.minute > minute) break;
+      if (e.side === "home") h += 1;
+      else a += 1;
+    }
+    return { home: h, away: a };
+  };
+
+  for (const c of updates) {
+    const anchor = Math.max(...(c.members ?? []).map((m) => m.minute ?? 0));
+    const running = scoreAt(anchor);
+    c.goalsHome = running.home;
+    c.goalsAway = running.away;
   }
 }
 

@@ -1,21 +1,28 @@
+import { createHash } from "node:crypto";
 import { getDb } from "@/lib/db";
 import { MAX_POSTS_PER_RUN, POST_DELAY_MS, dailyBudget, detailMaxBatchesPerRun } from "./config";
 import {
   ApiAccountError,
   ApiBudgetExceededError,
+  FacebookConfigError,
   errorMessage,
   isAuthFailure,
+  isUncertainFailure,
   isUndeliverable,
 } from "./errors";
 import {
+  criticalDetailSlotsAvailable,
   detailSlotsAvailable,
   embeddedLineups,
   fetchFixtureDetails,
   fetchLiveFixtures,
-  fetchTeamCountry,
   getUsageToday,
 } from "./api";
-import { isFacebookConfigured, postToFacebookPage } from "./facebook";
+import {
+  getRecentFacebookPagePosts,
+  isFacebookConfigured,
+  postToFacebookPage,
+} from "./facebook";
 import {
   buildSnapshot,
   competitionTier,
@@ -38,20 +45,27 @@ import {
   ensureSchema,
   finishRun,
   getEventStatuses,
+  linkMemberKeysToParent,
+  loadChildEventKeys,
   loadDroppedFixtureIds,
   loadRetryableEvents,
   loadStates,
+  loadUncertainEvents,
   markEventAuthBlocked,
   markEventFailed,
   markEventPermanentlyFailed,
   markEventPosted,
+  markEventUncertain,
   markKeysAuthBlocked,
   markKeysFailed,
+  markKeysUncertain,
   markKeysPosted,
   markUnresolved,
   reapStaleClaims,
   recordSystemEvent,
   reconcileKeysPosted,
+  reconcilePostedChildren,
+  releaseUncertainKeys,
   startRun,
   type StateRow,
   tryClaimKey,
@@ -88,6 +102,7 @@ export interface AutomationSummary {
   retriedPosts: number;
   milestonesPosted: number;
   milestonesDeferred: number;
+  ordinaryCandidates: number;
   skippedFixtures: number;
   unresolvedFixtures: number;
   facebookAuthBlocked: boolean;
@@ -106,7 +121,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const MAX_LINEUP_FETCHES_PER_RUN = 2;
 /** Stop publishing before the serverless function is killed (maxDuration 60s). */
 const RUN_TIME_BUDGET_MS = 45000;
 /**
@@ -116,6 +130,8 @@ const RUN_TIME_BUDGET_MS = 45000;
 const MILESTONE_TIME_BUDGET_MS = 52000;
 /** Failed posts re-attempted per run (database only - costs no API requests). */
 const MAX_RETRIES_PER_RUN = 5;
+/** Do not decide an uncertain Graph outcome until propagation has had time. */
+const UNCERTAIN_RECONCILE_GRACE_MS = 2 * 60 * 1000;
 /** Only keep trying to fetch a Starting XI while the match is young. */
 const LINEUP_FETCH_MAX_MINUTE = 40;
 
@@ -123,12 +139,14 @@ function scoreline(c: Pick<CandidateEvent, "goalsHome" | "goalsAway">): string {
   return `${c.goalsHome ?? 0}-${c.goalsAway ?? 0}`;
 }
 
-/** Deterministic key for a grouped update: stable for the identical member set. */
+/**
+ * Collision-resistant deterministic key for a grouped update. A prior 32-bit
+ * hash could theoretically collide and suppress an unrelated post.
+ */
 function groupKey(fixtureId: number, members: UpdateMember[]): string {
   const joined = members.map((m) => m.key).sort().join(";");
-  let hash = 5381;
-  for (let i = 0; i < joined.length; i++) hash = ((hash << 5) + hash + joined.charCodeAt(i)) >>> 0;
-  return `fx${fixtureId}:lu:${hash.toString(16)}`;
+  const digest = createHash("sha256").update(joined).digest("hex").slice(0, 32);
+  return `fx${fixtureId}:lu:${digest}`;
 }
 
 export async function runAutomation(): Promise<AutomationSummary> {
@@ -153,6 +171,7 @@ export async function runAutomation(): Promise<AutomationSummary> {
     retriedPosts: 0,
     milestonesPosted: 0,
     milestonesDeferred: 0,
+    ordinaryCandidates: 0,
     skippedFixtures: 0,
     unresolvedFixtures: 0,
     facebookAuthBlocked: false,
@@ -178,13 +197,19 @@ export async function runAutomation(): Promise<AutomationSummary> {
   try {
     runId = await startRun(sql, startedAtIso);
 
-    // Release claims orphaned by a previous crashed/timed-out invocation so
-    // those events become retryable instead of being silently lost.
+    // Claims orphaned by a crashed/timed-out invocation have an UNKNOWN
+    // Facebook outcome. Reconcile them instead of retrying blindly.
     try {
       const reaped = await reapStaleClaims(sql);
-      if (reaped > 0) summary.notes.push(`${reaped} stale claim(s) released for retry.`);
+      if (reaped > 0) {
+        summary.notes.push(`${reaped} stale claim(s) moved to uncertain reconciliation.`);
+      }
+      const repaired = await reconcilePostedChildren(sql);
+      if (repaired > 0) {
+        summary.notes.push(`${repaired} child event claim(s) reconciled from posted parents.`);
+      }
     } catch (error) {
-      summary.notes.push(`Stale-claim sweep failed: ${errorMessage(error)}`);
+      summary.notes.push(`Claim reconciliation sweep failed: ${errorMessage(error)}`);
     }
 
     /* 1) Heartbeat: all live fixtures across every competition (the single
@@ -194,20 +219,27 @@ export async function runAutomation(): Promise<AutomationSummary> {
       liveFixtures = await fetchLiveFixtures(sql);
     } catch (error) {
       if (error instanceof ApiBudgetExceededError) {
+        /**
+         * Daily quota exhausted. The heartbeat cannot be paid for, but the
+         * finish detector needs no requests at all: it works from state we
+         * already stored while the matches were live. Continue with an empty
+         * live list so unambiguous finishes are still published, and leave the
+         * ambiguous ones flagged rather than guessed.
+         */
         summary.notes.push(errorMessage(error));
         await recordSystemEvent(sql, "api_error", errorMessage(error));
         return finalize("skipped", null);
-      }
-      if (error instanceof ApiAccountError) {
+      } else if (error instanceof ApiAccountError) {
         await recordSystemEvent(sql, "api_error", errorMessage(error));
         // Suspended/invalid account: stop immediately, keep state intact and
         // surface a clear diagnostic. Normal operation resumes automatically
         // once the API account is restored.
         summary.notes.push(errorMessage(error));
         return finalize("failed", errorMessage(error));
+      } else {
+        await recordSystemEvent(sql, "api_error", errorMessage(error));
+        throw error;
       }
-      await recordSystemEvent(sql, "api_error", errorMessage(error));
-      throw error;
     }
     summary.liveFixtures = liveFixtures.length;
 
@@ -302,11 +334,16 @@ export async function runAutomation(): Promise<AutomationSummary> {
     /* 4) Detail batch A: dropped fixtures - Tier 1 only (FT detection).
           Only Tier 1 fixtures are ever tracked, so recovery is Tier 1 only. */
     let detailSlots = 0;
+    let criticalDetailSlots = 0;
     let apiBlocked = false;
     try {
-      detailSlots = await detailSlotsAvailable(sql);
+      [detailSlots, criticalDetailSlots] = await Promise.all([
+        detailSlotsAvailable(sql),
+        criticalDetailSlotsAvailable(sql),
+      ]);
     } catch {
       detailSlots = 0;
+      criticalDetailSlots = 0;
     }
 
     let droppedIds = await loadDroppedFixtureIds(sql, liveIds);
@@ -314,27 +351,64 @@ export async function runAutomation(): Promise<AutomationSummary> {
       const droppedStates = await loadStates(sql, droppedIds);
       droppedIds = droppedIds.filter((id) => {
         const snap = droppedStates.get(id)?.snapshot;
-        return snap ? classifyCompetition(snap.leagueName, snap.leagueCountry) === 1 : false;
+        return snap
+          ? classifyCompetition(snap.leagueName, snap.leagueCountry, snap.leagueId ?? null) === 1
+          : false;
       });
     }
-    // Detail recovery uses `/fixtures?ids=` (up to 20 per request, official)
-    // with an automatic fall back to `/fixtures?id=` if the plan rejects it.
-    // The response embeds events AND lineups, so no extra lineup call is made.
-    const recoverable = Math.max(0, Math.min(droppedIds.length, detailSlots > 0 ? droppedIds.length : 0));
-    const detailTargets = droppedIds.slice(0, recoverable);
-    let detailRequestsUsed = 0;
+
+    /**
+     * FINISH DETECTOR - CONFIRMED RESULTS ONLY.
+     *
+     * `/fixtures?live=all` reports in-play statuses only (1H HT 2H ET BT P),
+     * so a match that ends between two cron runs leaves the feed without ever
+     * showing FT. Its final status and score are therefore read back from the
+     * fixture endpoint.
+     *
+     * Accuracy rule: a final result is ONLY ever published from a status the
+     * API explicitly returned. Nothing is inferred from stored state, because
+     * a goal scored after our last poll (a stoppage-time winner, a shootout
+     * kick) would make an inferred score wrong. If no request can be spared,
+     * the finish stays queued and is confirmed on a later run - it is never
+     * guessed.
+     *
+     * Cost: `/fixtures?ids=` confirms up to 20 matches in ONE request, so a
+     * whole matchday of finishes usually costs a single request from the
+     * existing daily budget.
+     */
+    const droppedStates = droppedIds.length > 0 ? await loadStates(sql, droppedIds) : new Map<number, StateRow>();
+
+    // Dropped fixtures were already allowlisted above; record them so the
+    // final posting gate accepts their confirmed finish.
+    for (const id of droppedIds) approvedFixtureIds.add(id);
+
+    const confirmTargets = [...droppedIds];
+    const lineupWantedSet = new Set(lineupWanted);
+
+    /**
+     * Lineups ride along in the SAME batched request as finish confirmations,
+     * which costs nothing extra. With no finish pending, lineups may use only
+     * normal optional slots; finish confirmation may use the configured safety
+     * reserve through criticalDetailSlots. Future heartbeat slots remain
+     * untouchable in both cases.
+     */
+    const requestAllowance =
+      confirmTargets.length > 0 ? criticalDetailSlots : detailSlots;
+    const detailTargets =
+      requestAllowance > 0 && (confirmTargets.length > 0 || lineupWanted.length > 0)
+        ? [...new Set([...confirmTargets, ...lineupWanted])].slice(0, 20)
+        : [];
+    const droppedSet = new Set(droppedIds);
     const recoveredStates: Map<number, StateRow> =
       detailTargets.length > 0 ? await loadStates(sql, detailTargets) : new Map();
 
-    if (detailTargets.length > 0 && detailSlots > 0) {
+    if (detailTargets.length > 0) {
       try {
-        const detail = await fetchFixtureDetails(sql, detailTargets, detailSlots);
-        detailRequestsUsed = detail.requestsUsed;
+        const detail = await fetchFixtureDetails(sql, detailTargets, requestAllowance);
         const resolvedIds: number[] = [];
         for (const fixture of detail.fixtures) {
           const fixtureId = fixture.fixture.id;
           try {
-            // Re-verify: a fixture must never enter via a detail lookup.
             const decision = competitionDecision(
               fixture.league?.name,
               fixture.league?.country ?? null,
@@ -349,15 +423,86 @@ export async function runAutomation(): Promise<AutomationSummary> {
               recoveredStates.get(fixtureId)?.snapshot ?? states.get(fixtureId)?.snapshot ?? null;
             candidates.push(...diffFixture(previous, fixture, { bootstrap }));
             const snapshot = buildSnapshot(fixture);
-            snapshot.lineupPosted = previous?.lineupPosted ?? false;
+            snapshot.lineupPosted =
+              (previous?.lineupPosted ?? false) ||
+              (droppedStates.get(fixtureId)?.snapshot?.lineupPosted ?? false);
             snapshot.lastPostedScoreline = previous?.lastPostedScoreline ?? null;
             snapshots.set(fixtureId, { snapshot, terminal: isTerminalStatus(snapshot.statusShort) });
             if (isTerminalStatus(snapshot.statusShort)) resolvedIds.push(fixtureId);
+
+            /**
+             * Diagnostic: the confirmed final score differs from the last
+             * score we published while the match was live. This is the
+             * stoppage-time-goal case - the goal itself is picked up by the
+             * diff above and merged into the FT post, so nothing is wrong,
+             * but the divergence is recorded for review.
+             */
+            if (isTerminalStatus(snapshot.statusShort) && previous?.lastPostedScoreline) {
+              const confirmed = `${snapshot.goalsHome ?? 0}-${snapshot.goalsAway ?? 0}`;
+              if (confirmed !== previous.lastPostedScoreline) {
+                await recordSystemEvent(
+                  sql,
+                  "api_error",
+                  `fx${fixtureId} final score ${confirmed} differs from last posted ${previous.lastPostedScoreline} (late goal)`,
+                ).catch(() => undefined);
+              }
+            }
+
+            // Reuse this same response for a pending starting XI - no extra call.
+            if (lineupWantedSet.has(fixtureId) && !snapshot.lineupPosted) {
+              const lineups = embeddedLineups(fixture);
+              const isInternational =
+                (snapshot.leagueCountry ?? "").trim().toLowerCase() === "world";
+              const homeLineupTeam =
+                lineups.find((l) => l.team?.name === snapshot.home) ?? lineups[0];
+              const awayLineupTeam =
+                lineups.find((l) => l.team?.name === snapshot.away) ??
+                (lineups.length > 1 ? lineups[1] : undefined);
+              const noMetadataCall = async () => null;
+              const homeResolved = homeLineupTeam
+                ? await resolveTeamFlag(sql, {
+                    id: homeLineupTeam.team?.id ?? null,
+                    name: homeLineupTeam.team?.name ?? snapshot.home,
+                  }, { isInternational, budgetSlots: 0, fetchTeamMeta: noMetadataCall })
+                : { flag: "", source: "none" as const };
+              const awayResolved = awayLineupTeam
+                ? await resolveTeamFlag(sql, {
+                    id: awayLineupTeam.team?.id ?? null,
+                    name: awayLineupTeam.team?.name ?? snapshot.away,
+                  }, { isInternational, budgetSlots: 0, fetchTeamMeta: noMetadataCall })
+                : { flag: "", source: "none" as const };
+              const postData = buildLineupPostData(lineups, snapshot.home, snapshot.away, {
+                homeFlag: homeResolved.flag,
+                awayFlag: awayResolved.flag,
+              });
+              if (postData) {
+                summary.lineupsFetched += 1;
+                candidates.push({
+                  eventKey: `fx${fixtureId}:lineup`,
+                  fixtureId,
+                  kind: "lineup",
+                  minute: 0,
+                  sortRank: -6,
+                  league: snapshot.leagueName,
+                  leagueCountry: snapshot.leagueCountry,
+                  leagueFlagCode: snapshot.leagueFlagCode,
+                  home: snapshot.home,
+                  away: snapshot.away,
+                  goalsHome: snapshot.goalsHome,
+                  goalsAway: snapshot.goalsAway,
+                  pensHome: snapshot.pensHome,
+                  pensAway: snapshot.pensAway,
+                  statusShort: snapshot.statusShort,
+                  lineup: postData,
+                });
+                snapshot.lineupPosted = true;
+              }
+            }
           } catch (error) {
             summary.notes.push(`Recovered fixture ${fixtureId} skipped: ${errorMessage(error)}`);
           }
         }
-        summary.droppedRecovered += detail.fixtures.length;
+        summary.droppedRecovered += detail.fixtures.filter((f) => droppedSet.has(f.fixture.id)).length;
         if (resolvedIds.length > 0) await markUnresolved(sql, resolvedIds, false).catch(() => undefined);
       } catch (error) {
         if (error instanceof ApiAccountError || error instanceof ApiBudgetExceededError) {
@@ -368,108 +513,21 @@ export async function runAutomation(): Promise<AutomationSummary> {
       }
     }
 
-    /* Fixtures that vanished from the live list and could NOT be confirmed are
-       flagged unresolved. We never invent a full-time result for them. */
+    /* Fixtures that left the live list without a confirmed result. They stay
+       queued in fixture_state and are confirmed on a later run (within the
+       recovery window) - a result is never invented for them. */
     const stillUnknown = droppedIds.filter((dropId) => !snapshots.has(dropId));
     if (stillUnknown.length > 0) {
       summary.unresolvedFixtures = stillUnknown.length;
       await markUnresolved(sql, stillUnknown, true).catch(() => undefined);
       summary.notes.push(
-        `${stillUnknown.length} fixture(s) left the live list without a confirmed final status (no result published).`,
+        `${stillUnknown.length} finish(es) awaiting confirmation (no result published until the API confirms it).`,
       );
     }
 
-    /* 5) Detail batch B: Starting XI for Tier 1, only with safe remaining budget. */
-    const lineupBudget = apiBlocked
-      ? 0
-      : Math.max(0, Math.min(detailSlots - detailRequestsUsed, MAX_LINEUP_FETCHES_PER_RUN));
-
-    if (lineupBudget > 0 && lineupWanted.length > 0) {
-      try {
-        // One detail request returns events AND lineups for up to 20 fixtures.
-        const detail = await fetchFixtureDetails(sql, lineupWanted.slice(0, 20), lineupBudget);
-        for (const fixture of detail.fixtures) {
-          const fixtureId = fixture.fixture.id;
-          const entry = snapshots.get(fixtureId);
-          if (!entry) continue;
-          try {
-            const lineups = embeddedLineups(fixture);
-            const isInternational =
-              (entry.snapshot.leagueCountry ?? "").trim().toLowerCase() === "world";
-
-            // Dynamic club-country detection (cache -> budget-guarded API -> omit).
-            const homeLineupTeam = lineups.find(
-              (l) => l.team?.name === entry.snapshot.home,
-            ) ?? lineups[0];
-            const awayLineupTeam = lineups.find(
-              (l) => l.team?.name === entry.snapshot.away,
-            ) ?? (lineups.length > 1 ? lineups[1] : undefined);
-
-            let teamMetaSlots = Math.max(0, detailSlots - detailRequestsUsed);
-            const homeResolved = homeLineupTeam
-              ? await resolveTeamFlag(sql, {
-                  id: homeLineupTeam.team?.id ?? null,
-                  name: homeLineupTeam.team?.name ?? entry.snapshot.home,
-                }, {
-                  isInternational,
-                  budgetSlots: teamMetaSlots,
-                  fetchTeamMeta: (id) => fetchTeamCountry(sql, id),
-                })
-              : { flag: "", source: "none" as const };
-            if (homeResolved.source === "api") teamMetaSlots = Math.max(0, teamMetaSlots - 1);
-            const awayResolved = awayLineupTeam
-              ? await resolveTeamFlag(sql, {
-                  id: awayLineupTeam.team?.id ?? null,
-                  name: awayLineupTeam.team?.name ?? entry.snapshot.away,
-                }, {
-                  isInternational,
-                  budgetSlots: teamMetaSlots,
-                  fetchTeamMeta: (id) => fetchTeamCountry(sql, id),
-                })
-              : { flag: "", source: "none" as const };
-
-            const postData = buildLineupPostData(
-              lineups,
-              entry.snapshot.home,
-              entry.snapshot.away,
-              { homeFlag: homeResolved.flag, awayFlag: awayResolved.flag },
-            );
-            if (postData) {
-              summary.lineupsFetched += 1;
-              candidates.push({
-                eventKey: `fx${fixtureId}:lineup`,
-                fixtureId,
-                kind: "lineup",
-                minute: 0,
-                sortRank: -6,
-                league: entry.snapshot.leagueName,
-                leagueCountry: entry.snapshot.leagueCountry,
-                leagueFlagCode: entry.snapshot.leagueFlagCode,
-                home: entry.snapshot.home,
-                away: entry.snapshot.away,
-                goalsHome: entry.snapshot.goalsHome,
-                goalsAway: entry.snapshot.goalsAway,
-                pensHome: entry.snapshot.pensHome,
-                pensAway: entry.snapshot.pensAway,
-                statusShort: entry.snapshot.statusShort,
-                lineup: postData,
-              });
-              entry.snapshot = { ...entry.snapshot, lineupPosted: true };
-            }
-            // Detail responses also carry fresher events than the heartbeat.
-            const previous = states.get(fixtureId)?.snapshot ?? null;
-            if (previous) candidates.push(...diffFixture(previous, fixture, { bootstrap }));
-          } catch (error) {
-            summary.notes.push(`Lineup handling failed for fixture ${fixtureId}: ${errorMessage(error)}`);
-          }
-        }
-      } catch (error) {
-        if (error instanceof ApiAccountError || error instanceof ApiBudgetExceededError) {
-          apiBlocked = true;
-        }
-        summary.notes.push(`Starting XI fetch skipped: ${errorMessage(error)}`);
-      }
-    }
+    /* 5) No standalone lineup/detail request.
+       Lineups are processed from the recovery batch above, so final-status
+       reconciliation can never be starved by an earlier optional lookup. */
 
     /* 6) De-duplicate, merge FT with its final goal, order, cap. */
     const unique = new Map<string, CandidateEvent>();
@@ -498,38 +556,6 @@ export async function runAutomation(): Promise<AutomationSummary> {
      * posts. Member-level claims still guarantee a goal already published in
      * an earlier run is never repeated inside the FT post.
      */
-    for (const candidate of [...unique.values()]) {
-      if (candidate.kind !== "fulltime") continue;
-      /**
-       * Only the GOAL category merges into the full-time post ("FT with the
-       * final goal beneath"). Cards, substitutions and VAR decisions detected
-       * in the same run remain their own category posts - mixing them into the
-       * FT post would violate the category-grouping rule.
-       */
-      /**
-       * Collect EVERY unpublished goal-category candidate for this fixture
-       * (goals are now individual posts) and merge them under the full-time
-       * line, preserving chronological order.
-       */
-      const goalPrefix = `live_update:${candidate.fixtureId}:goal`;
-      const goalCandidates = [...unique.entries()].filter(
-        ([k, v]) => k.startsWith(goalPrefix) && v.kind === "live_update",
-      );
-      if (goalCandidates.length === 0) continue;
-      const merged = [
-        ...(candidate.members ?? []),
-        ...goalCandidates.flatMap(([, v]) => v.members ?? []),
-      ];
-      const seen = new Set<string>();
-      candidate.members = merged.filter((m) => {
-        if (seen.has(m.key)) return false;
-        seen.add(m.key);
-        return true;
-      });
-      // Keep the authoritative final score from the full-time payload.
-      for (const [k] of goalCandidates) unique.delete(k);
-    }
-
     /**
      * FINAL ALLOWLIST GATE.
      * Every candidate - including ones produced by detail lookups or carried
@@ -566,19 +592,12 @@ export async function runAutomation(): Promise<AutomationSummary> {
      * queued behind goals, lineups or cards and are exempt from the ordinary
      * post cap.
      */
-    const milestoneQueue = bootstrap ? [] : ordered.filter((c) => isMilestoneKind(c.kind));
-    const ordinaryAll = bootstrap ? [] : ordered.filter((c) => !isMilestoneKind(c.kind));
-    const ordinaryQueue = ordinaryAll.slice(0, MAX_POSTS_PER_RUN);
-    if (ordinaryAll.length > ordinaryQueue.length) {
-      summary.notes.push(
-        `${ordinaryAll.length - ordinaryQueue.length} ordinary event(s) skipped by the per-run post cap of ${MAX_POSTS_PER_RUN} (milestones unaffected).`,
-      );
-    }
+    summary.ordinaryCandidates = ordered.filter((c) => !isMilestoneKind(c.kind)).length;
     summary.candidates = ordered.length;
 
     /* 7) Claim -> compose -> post -> mark (all idempotent via Neon event keys). */
     const facebookReady = isFacebookConfigured();
-    if (!facebookReady && milestoneQueue.length + ordinaryQueue.length > 0) {
+    if (!facebookReady && ordered.length > 0) {
       summary.notes.push(
         "Facebook is not configured (FACEBOOK_PAGE_ID / FACEBOOK_PAGE_ACCESS_TOKEN) - events tracked but not posted.",
       );
@@ -593,15 +612,26 @@ export async function runAutomation(): Promise<AutomationSummary> {
      *  - everything else       -> 'failed' and retried later.
      */
     let authBlocked = false;
+    let authBlockError: unknown = null;
     const handlePostFailure = async (eventKey: string, memberKeys: string[], error: unknown) => {
       if (isAuthFailure(error)) {
         authBlocked = true;
+        authBlockError = error;
         summary.facebookAuthBlocked = true;
         await markEventAuthBlocked(sql, eventKey, error).catch(() => undefined);
         await markKeysAuthBlocked(sql, memberKeys, error).catch(() => undefined);
         await recordSystemEvent(sql, "facebook_auth_error", errorMessage(error));
         summary.notes.push(
           `Facebook authentication failed - publishing paused, events stay queued: ${errorMessage(error)}`,
+        );
+        return;
+      }
+      if (isUncertainFailure(error)) {
+        await markEventUncertain(sql, eventKey, error).catch(() => undefined);
+        await markKeysUncertain(sql, memberKeys, error).catch(() => undefined);
+        summary.postingFailed += 1;
+        summary.notes.push(
+          `Facebook publish outcome uncertain (${eventKey}); queued for feed reconciliation, not retried blindly.`,
         );
         return;
       }
@@ -615,28 +645,51 @@ export async function runAutomation(): Promise<AutomationSummary> {
       summary.notes.push(`Post failed (${eventKey}): ${errorMessage(error)}`);
     };
 
-    const postSingle = async (candidate: CandidateEvent, message: string): Promise<void> => {
+    const postSingle = async (
+      candidate: CandidateEvent,
+      message: string,
+      queueWithoutDelivery?: unknown,
+    ): Promise<void> => {
       const claim = await claimEvent(sql, candidate, message);
       if (claim === "duplicate") {
         summary.duplicatesSkipped += 1;
         return;
       }
+      if (queueWithoutDelivery) {
+        await handlePostFailure(candidate.eventKey, [], queueWithoutDelivery);
+        return;
+      }
+      let post: { id: string };
       try {
-        const post = await postToFacebookPage(message);
-        await markEventPosted(sql, candidate.eventKey, post.id);
-        await recordSystemEvent(sql, "facebook_delivered", candidate.kind);
-        summary.posted += 1;
-        const entry = snapshots.get(candidate.fixtureId);
-        if (entry && (candidate.kind === "kickoff" || candidate.kind === "live_update")) {
-          entry.snapshot = { ...entry.snapshot, lastPostedScoreline: scoreline(candidate) };
-        }
-        await sleep(POST_DELAY_MS);
+        post = await postToFacebookPage(message);
       } catch (error) {
         await handlePostFailure(candidate.eventKey, [], error);
+        return;
       }
+
+      // Graph confirmed success. A later Neon failure must NEVER turn this
+      // into a Facebook retry; preserve it as uncertain for feed reconciliation.
+      summary.posted += 1;
+      try {
+        await markEventPosted(sql, candidate.eventKey, post.id);
+      } catch (error) {
+        await markEventUncertain(sql, candidate.eventKey, error).catch(() => undefined);
+        summary.notes.push(
+          `Facebook delivered ${candidate.eventKey}, but Neon acknowledgement failed; queued for reconciliation.`,
+        );
+      }
+      await recordSystemEvent(sql, "facebook_delivered", candidate.kind).catch(() => undefined);
+      const entry = snapshots.get(candidate.fixtureId);
+      if (entry && (candidate.kind === "kickoff" || candidate.kind === "live_update")) {
+        entry.snapshot = { ...entry.snapshot, lastPostedScoreline: scoreline(candidate) };
+      }
+      await sleep(POST_DELAY_MS);
     };
 
-    const postGroupedUpdate = async (candidate: CandidateEvent): Promise<void> => {
+    const postGroupedUpdate = async (
+      candidate: CandidateEvent,
+      queueWithoutDelivery?: unknown,
+    ): Promise<void> => {
       const members = candidate.members ?? [];
       const memberKeys = members.map((m) => m.key);
 
@@ -657,7 +710,11 @@ export async function runAutomation(): Promise<AutomationSummary> {
       if (included.length === 0 && candidate.kind !== "live_update") {
         // Status post (e.g. FT) whose goal was already published earlier:
         // still publish the status itself, just without the goal line.
-        await postSingle({ ...candidate, members: [] }, composeMessage({ ...candidate, members: [] }));
+        await postSingle(
+          { ...candidate, members: [] },
+          composeMessage({ ...candidate, members: [] }),
+          queueWithoutDelivery,
+        );
         return;
       }
 
@@ -686,48 +743,86 @@ export async function runAutomation(): Promise<AutomationSummary> {
 
       const composed = { ...candidate, members: included, eventKey: compositeKey };
       const message = composeMessage(composed);
+      await linkMemberKeysToParent(sql, included.map((m) => m.key), compositeKey);
 
       const claim = await claimEvent(sql, composed, message);
       if (claim === "duplicate") {
-        await reconcileKeysPosted(sql, included.map((m) => m.key)).catch(() => undefined);
+        const parentStatus = (await getEventStatuses(sql, [compositeKey])).get(compositeKey);
+        if (parentStatus === "posted") {
+          await reconcileKeysPosted(sql, included.map((m) => m.key)).catch(() => undefined);
+        } else if (parentStatus === "uncertain") {
+          await markKeysUncertain(
+            sql,
+            included.map((m) => m.key),
+            new Error("parent Facebook outcome is uncertain"),
+          ).catch(() => undefined);
+        }
+        // A claimed parent is still in flight; leave child claims linked and
+        // let the winner confirm them or the stale-claim reconciler handle it.
         summary.duplicatesSkipped += 1;
         return;
       }
 
       const memberKeysToMark = included.map((m) => m.key);
+      if (queueWithoutDelivery) {
+        await handlePostFailure(compositeKey, memberKeysToMark, queueWithoutDelivery);
+        return;
+      }
+      let post: { id: string };
       try {
-        const post = await postToFacebookPage(message);
-        await markEventPosted(sql, compositeKey, post.id);
-        await markKeysPosted(sql, memberKeysToMark, post.id);
-        await recordSystemEvent(sql, "facebook_delivered", "live_update");
-        summary.posted += 1;
-        const entry = snapshots.get(candidate.fixtureId);
-        if (entry) entry.snapshot = { ...entry.snapshot, lastPostedScoreline: current };
-        await sleep(POST_DELAY_MS);
+        post = await postToFacebookPage(message);
       } catch (error) {
         await handlePostFailure(compositeKey, memberKeysToMark, error);
+        return;
       }
+
+      summary.posted += 1;
+      let parentRecorded = false;
+      try {
+        await markEventPosted(sql, compositeKey, post.id);
+        parentRecorded = true;
+      } catch (error) {
+        await markEventUncertain(sql, compositeKey, error).catch(() => undefined);
+        await markKeysUncertain(sql, memberKeysToMark, error).catch(() => undefined);
+        summary.notes.push(
+          `Facebook delivered ${compositeKey}, but Neon acknowledgement failed; queued for reconciliation.`,
+        );
+      }
+      if (parentRecorded) {
+        // If this child update fails, reconcilePostedChildren repairs it at the
+        // start of the next run from the confirmed posted parent.
+        await markKeysPosted(sql, memberKeysToMark, post.id).catch((error) => {
+          summary.notes.push(`Child claim acknowledgement deferred: ${errorMessage(error)}`);
+        });
+      }
+      await recordSystemEvent(sql, "facebook_delivered", "live_update").catch(() => undefined);
+      const entry = snapshots.get(candidate.fixtureId);
+      if (entry) entry.snapshot = { ...entry.snapshot, lastPostedScoreline: current };
+      await sleep(POST_DELAY_MS);
     };
 
     const outOfTime = () => Date.now() - startedAt.getTime() > RUN_TIME_BUDGET_MS;
 
-    /**
-     * Retries replay a stored message for a fixture claimed in an earlier run.
-     * If that fixture is visible in this run it must still be approved; if it
-     * is not visible we allow the retry, because the event was already cleared
-     * by the gate when it was first claimed.
-     */
-    const seenThisRun = new Set<number>([...snapshots.keys()]);
-    const retryApprovalBlocked = (fixtureId: number): boolean =>
-      seenThisRun.has(fixtureId) && !approvedFixtureIds.has(fixtureId);
+    {
 
-    if (facebookReady) {
+      // Missing credentials: queue every candidate immediately, without making
+      // any Graph request. Expired credentials discovered during delivery set
+      // authBlockError; every remaining candidate is then queued the same way.
+      if (!facebookReady) {
+        authBlocked = true;
+        authBlockError = new FacebookConfigError(
+          "FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN must both be configured",
+        );
+        summary.facebookAuthBlocked = true;
+      }
+
       const publish = async (candidate: CandidateEvent) => {
         try {
+          const queueError = authBlockError ?? undefined;
           if (candidate.kind === "live_update" || (candidate.members?.length ?? 0) > 0) {
-            await postGroupedUpdate(candidate);
+            await postGroupedUpdate(candidate, queueError);
           } else {
-            await postSingle(candidate, composeMessage(candidate));
+            await postSingle(candidate, composeMessage(candidate), queueError);
           }
         } catch (error) {
           summary.postingFailed += 1;
@@ -735,60 +830,142 @@ export async function runAutomation(): Promise<AutomationSummary> {
         }
       };
 
-      /* 7a) MILESTONES FIRST - never starved by ordinary events. They use a
-             wider time allowance because a missed milestone (especially FT)
-             cannot be regenerated by snapshot diffing on a later run. */
-      for (const candidate of milestoneQueue) {
-        if (authBlocked) {
-          summary.milestonesDeferred += 1;
+      /**
+       * PUBLISH IN MATCH ORDER.
+       *
+       * Posts go out chronologically (a 90+4 goal before the full-time line),
+       * which is what a follower expects to read. Starvation protection is
+       * preserved by treating milestones differently *within* the same pass:
+       * milestones are exempt from the ordinary per-run post cap and get a
+       * wider time allowance, so a busy run can never drop a full-time.
+       */
+      let ordinaryPosted = 0;
+      let deferred = 0;
+      for (const candidate of ordered) {
+        const milestone = isMilestoneKind(candidate.kind);
+        if (!milestone && ordinaryPosted >= MAX_POSTS_PER_RUN) {
+          deferred += 1;
           continue;
         }
-        if (Date.now() - startedAt.getTime() > MILESTONE_TIME_BUDGET_MS) {
-          summary.milestonesDeferred += 1;
-          summary.notes.push(`Milestone deferred to the next run (time budget): ${candidate.eventKey}`);
+        const budget = milestone ? MILESTONE_TIME_BUDGET_MS : RUN_TIME_BUDGET_MS;
+        if (Date.now() - startedAt.getTime() > budget) {
+          if (milestone) {
+            summary.milestonesDeferred += 1;
+            summary.notes.push(`Milestone deferred to the next run (time budget): ${candidate.eventKey}`);
+          } else {
+            deferred += 1;
+          }
           continue;
         }
         const before = summary.posted;
         await publish(candidate);
-        if (summary.posted > before) summary.milestonesPosted += 1;
-      }
-
-      /* 7b) Ordinary events, subject to the per-run cap and time budget. */
-      let deferred = 0;
-      for (const candidate of ordinaryQueue) {
-        if (outOfTime() || authBlocked) {
-          deferred += 1;
-          continue;
+        if (summary.posted > before) {
+          if (milestone) summary.milestonesPosted += 1;
+          else ordinaryPosted += 1;
         }
-        await publish(candidate);
       }
       if (deferred > 0) {
-        summary.notes.push(`${deferred} ordinary event(s) deferred to the next run (run time budget).`);
+        summary.notes.push(`${deferred} ordinary event(s) deferred to the next run (cap or time budget).`);
       }
 
-      /* 7b) Retry previously failed posts. Snapshot diffing will not recreate
+      /* 7b) Reconcile unknown Graph POST outcomes before any retry. */
+      try {
+        const uncertain = authBlocked ? [] : await loadUncertainEvents(sql, 50);
+        if (uncertain.length > 0) {
+          // One Page-feed read reconciles every uncertain post in this run.
+          const recentPosts = await getRecentFacebookPagePosts(100);
+          for (const item of uncertain) {
+            const attemptedAt = Date.parse(item.updatedAt);
+            const earliest = Number.isFinite(attemptedAt)
+              ? attemptedAt - 5 * 60 * 1000
+              : Date.now() - 24 * 60 * 60 * 1000;
+            const match = recentPosts.find((post) => {
+              if (post.message !== item.message) return false;
+              const created = Date.parse(post.createdTime ?? "");
+              return !Number.isFinite(created) || created >= earliest;
+            });
+            const childKeys = await loadChildEventKeys(sql, item.eventKey);
+            if (match) {
+              await markEventPosted(sql, item.eventKey, match.id);
+              await markKeysPosted(sql, childKeys, match.id);
+              summary.notes.push(`Reconciled Facebook post ${item.eventKey} as delivered.`);
+              continue;
+            }
+
+            // The next cron run is normally 15 minutes later, beyond this
+            // propagation grace. Only then is absence strong enough to release
+            // the post for the ordinary bounded retry queue.
+            if (Number.isFinite(attemptedAt) && Date.now() - attemptedAt >= UNCERTAIN_RECONCILE_GRACE_MS) {
+              await markEventFailed(
+                sql,
+                item.eventKey,
+                new Error("Facebook feed reconciliation found no matching post"),
+              );
+              await releaseUncertainKeys(sql, childKeys);
+              summary.notes.push(`Facebook post ${item.eventKey} confirmed absent; released for retry.`);
+            }
+          }
+        }
+      } catch (error) {
+        // Feed unavailable or token invalid: leave every row uncertain. Never
+        // risk a duplicate by converting an unknown outcome into a retry.
+        summary.notes.push(`Facebook uncertain-outcome reconciliation deferred: ${errorMessage(error)}`);
+      }
+
+      /* 7c) Retry previously failed posts. Snapshot diffing will not recreate
              them, so they are replayed from their stored message. Database
              only - this never consumes API-Football requests. */
       try {
         const retryables = authBlocked ? [] : await loadRetryableEvents(sql, MAX_RETRIES_PER_RUN);
+        const retryStates = await loadStates(
+          sql,
+          [...new Set(retryables.map((item) => item.fixtureId))],
+        );
         for (const retryable of retryables) {
-          // A retry must never resurrect a fixture that is no longer approved.
-          if (retryApprovalBlocked(retryable.fixtureId)) continue;
+          // A retry must never resurrect an unapproved or unverifiable fixture.
+          const retrySnapshot = retryStates.get(retryable.fixtureId)?.snapshot;
+          if (
+            !retrySnapshot ||
+            classifyCompetition(
+              retrySnapshot.leagueName,
+              retrySnapshot.leagueCountry,
+              retrySnapshot.leagueId ?? null,
+            ) !== 1
+          ) {
+            summary.notes.push(
+              `Retry blocked for fixture ${retryable.fixtureId}: competition cannot be re-verified.`,
+            );
+            continue;
+          }
           if (outOfTime() || authBlocked) break;
           const claimed = await claimRetry(sql, retryable.eventKey);
           if (!claimed) continue;
+          let post: { id: string };
           try {
-            const post = await postToFacebookPage(retryable.message);
-            await markEventPosted(sql, retryable.eventKey, post.id);
-            await recordSystemEvent(sql, "facebook_delivered", `retry:${retryable.kind}`);
-            summary.retriedPosts += 1;
-            summary.posted += 1;
-            await sleep(POST_DELAY_MS);
+            post = await postToFacebookPage(retryable.message);
           } catch (error) {
             await handlePostFailure(retryable.eventKey, [], error);
             summary.notes.push(`Retry failed (${retryable.eventKey}): ${errorMessage(error)}`);
             if (authBlocked) break;
+            continue;
           }
+
+          summary.retriedPosts += 1;
+          summary.posted += 1;
+          try {
+            await markEventPosted(sql, retryable.eventKey, post.id);
+          } catch (error) {
+            await markEventUncertain(sql, retryable.eventKey, error).catch(() => undefined);
+            summary.notes.push(
+              `Facebook delivered retry ${retryable.eventKey}, but Neon acknowledgement failed; queued for reconciliation.`,
+            );
+          }
+          await recordSystemEvent(
+            sql,
+            "facebook_delivered",
+            `retry:${retryable.kind}`,
+          ).catch(() => undefined);
+          await sleep(POST_DELAY_MS);
         }
       } catch (error) {
         summary.notes.push(`Retry sweep failed: ${errorMessage(error)}`);
