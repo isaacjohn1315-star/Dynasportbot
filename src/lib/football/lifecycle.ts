@@ -824,9 +824,8 @@ function applyRunningScores(
     .filter((e): e is { minute: number; side: "home" | "away" } => e.side !== null)
     .sort((a, b) => a.minute - b.minute);
 
-  const knownPrev = options.prevHome != null && options.prevAway != null;
-  const startHome = knownPrev ? (options.prevHome as number) : 0;
-  const startAway = knownPrev ? (options.prevAway as number) : 0;
+  const startHome = options.prevHome ?? 0;
+  const startAway = options.prevAway ?? 0;
 
   let endHome = startHome;
   let endAway = startAway;
@@ -834,9 +833,21 @@ function applyRunningScores(
     if (e.side === "home") endHome += 1;
     else endAway += 1;
   }
-  // Unknown baseline + mismatch => the event list is incomplete; publishing a
-  // reconstructed score would be a guess, so keep the reported one.
-  if (!knownPrev && (endHome !== options.actualHome || endAway !== options.actualAway)) return;
+  /**
+   * Reconciliation guard. If replaying the fresh scoring events on top of the
+   * previous score does not reproduce the score the API is reporting now, the
+   * reconstruction is unreliable - typically because the previous score already
+   * contained a goal whose event has only just appeared in the timeline.
+   * Reconstructing then would DOUBLE-COUNT that goal (showing 3-1 for a 2-1
+   * finish), so every post in this run uses the API's reported score instead.
+   */
+  if (endHome !== options.actualHome || endAway !== options.actualAway) {
+    for (const c of updates) {
+      c.goalsHome = options.actualHome;
+      c.goalsAway = options.actualAway;
+    }
+    return;
+  }
 
   const scoreAt = (minute: number): { home: number; away: number } => {
     let h = startHome;
@@ -850,7 +861,24 @@ function applyRunningScores(
   };
 
   for (const c of updates) {
-    const anchor = Math.max(...(c.members ?? []).map((m) => m.minute ?? 0));
+    const own = c.members ?? [];
+
+    /**
+     * Non-scoring events (cards, substitutions, VAR) must display the CURRENT
+     * confirmed score, never a reconstructed baseline. This is what kept a
+     * substitution at 0-0 after a goal had already made it 1-0.
+     */
+    const ownScoring = own.filter(
+      (m) => isScoringKind(m.kind) && scoringSide(m, options.home, options.away) !== null,
+    );
+    if (ownScoring.length === 0 || own.some((m) => m.minute == null)) {
+      c.goalsHome = options.actualHome;
+      c.goalsAway = options.actualAway;
+      continue;
+    }
+
+    // A scoring event shows the score as it stood at that goal's minute.
+    const anchor = Math.max(...ownScoring.map((m) => m.minute ?? 0));
     const running = scoreAt(anchor);
     c.goalsHome = running.home;
     c.goalsAway = running.away;

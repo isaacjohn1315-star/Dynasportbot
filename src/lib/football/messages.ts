@@ -165,10 +165,14 @@ const MEMBER_ORDER: Record<UpdateMember["kind"], number> = {
   substitution: 5,
 };
 
-/** Chronological event groups (each is one blank-line-separated block). */
+/**
+ * Event groups (each is one blank-line-separated block), ordered NEWEST FIRST
+ * so the most recent incident sits directly under the status line and older
+ * ones follow beneath it.
+ */
 function memberGroups(c: CandidateEvent): string[][] {
   const sorted = [...(c.members ?? [])].sort((a, b) => {
-    const minuteDelta = (a.minute ?? 0) - (b.minute ?? 0);
+    const minuteDelta = (b.minute ?? 0) - (a.minute ?? 0);
     if (minuteDelta !== 0) return minuteDelta;
     return MEMBER_ORDER[a.kind] - MEMBER_ORDER[b.kind];
   });
